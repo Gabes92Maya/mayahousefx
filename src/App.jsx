@@ -5,6 +5,8 @@ const SUPABASE_URL = "https://kdkmolutucldwkmomghb.supabase.co";
 const SUPABASE_KEY = "sb_publishable_G2LArtM7YgWdLoTWBAOd7g_ymvVzsoI";
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+const MTAPI_BASE = "https://mt5.mtapi.io";
+
 const fmt    = (n,d=2) => new Intl.NumberFormat("en-US",{minimumFractionDigits:d,maximumFractionDigits:d}).format(n);
 const fmtUSD = (n) => (n<0?"-$":"$")+fmt(Math.abs(n));
 const fmtPct = (n) => (n>=0?"+":"")+fmt(n)+"%";
@@ -16,209 +18,180 @@ const T = {
   light: { bg:"#eef1f8",surface:"#ffffff", surfaceAlt:"#f2f5fc",surfaceHover:"#e8edf8",border:"#d4dae8",text:"#0d1526",textSub:"#4a5568",textMuted:"#94a3b8",positive:"#16a34a",negative:"#dc2626",posLight:"rgba(22,163,74,0.08)",negLight:"rgba(220,38,38,0.08)",sidebar:"#161d2e" },
 };
 
-// ═══════════════════════════════════════════════════════════
-// MT5 HTML PARSER — Fixed for AXI/MT5 format
-// Column layout: 0=openTime 1=ticket 2=symbol 3=type 4=EMPTY
-//   5=volume 6=openPrice 7=SL 8=TP 9=closeTime 10=closePrice
-//   11=commission 12=swap 13=profit
-// ═══════════════════════════════════════════════════════════
-function parseMT5Report(htmlText) {
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(htmlText, "text/html");
-  const rows = doc.querySelectorAll("tr");
-
-  const trades = [];
-  let inPositions = false;
-
-  for (const row of rows) {
-    const rowText = row.textContent;
-
-    // Start collecting after "Positions" header
-    if (!inPositions) {
-      if (rowText.includes("Positions")) inPositions = true;
-      continue;
-    }
-    // Stop at "Orders" section
-    if (rowText.includes("Orders") || rowText.includes("Deals")) break;
-
-    const cells = row.querySelectorAll("td");
-    if (cells.length < 14) continue;
-
-    const openTime = cells[0]?.textContent?.trim();
-    // Must match date pattern like "2026.03.27 08:07:15"
-    if (!openTime || !/^\d{4}\.\d{2}\.\d{2}/.test(openTime)) continue;
-
-    try {
-      const closeTime  = cells[9]?.textContent?.trim() || "";
-      const commission = parseFloat(cells[11]?.textContent?.trim()) || 0;
-      const swap       = parseFloat(cells[12]?.textContent?.trim()) || 0;
-      // Remove spaces and non-breaking spaces from profit
-      const profitRaw  = (cells[13]?.textContent || "0").replace(/[\s\u00a0]/g, "");
-      const profit     = parseFloat(profitRaw) || 0;
-      const net        = profit + commission + swap;
-
-      // Convert "2026.03.27 08:16:37" → "2026-03-27"
-      const closeDate = closeTime.slice(0, 10).replace(/\./g, "-");
-      const openDate  = openTime.slice(0, 10).replace(/\./g, "-");
-
-      if (!closeDate || closeDate.length < 10) continue;
-
-      trades.push({
-        openDate, closeDate,
-        symbol:     cells[2]?.textContent?.trim() || "",
-        type:       cells[3]?.textContent?.trim() || "",
-        volume:     parseFloat(cells[5]?.textContent?.trim()) || 0,
-        openPrice:  parseFloat(cells[6]?.textContent?.trim()) || 0,
-        closePrice: parseFloat(cells[10]?.textContent?.trim()) || 0,
-        commission, swap, profit, net,
-      });
-    } catch { continue; }
-  }
-
-  if (trades.length === 0) return null;
-
-  // Aggregate daily P&L
-  const dailyPnL = {};
-  for (const t of trades) {
-    if (!dailyPnL[t.closeDate]) dailyPnL[t.closeDate] = { pnl: 0, trades: 0, wins: 0 };
-    dailyPnL[t.closeDate].pnl    += t.net;
-    dailyPnL[t.closeDate].trades += 1;
-    if (t.net > 0) dailyPnL[t.closeDate].wins += 1;
-  }
-
-  const totalPnL    = trades.reduce((s,t) => s + t.net, 0);
-  const grossProfit = trades.filter(t => t.net > 0).reduce((s,t) => s + t.net, 0);
-  const grossLoss   = trades.filter(t => t.net < 0).reduce((s,t) => s + t.net, 0);
-  const wins        = trades.filter(t => t.net > 0).length;
-  const losses      = trades.filter(t => t.net < 0).length;
-  const winRate     = trades.length > 0 ? (wins / trades.length) * 100 : 0;
-  const profitFactor= Math.abs(grossLoss) > 0 ? grossProfit / Math.abs(grossLoss) : 0;
-  const symbols     = [...new Set(trades.map(t => t.symbol))];
-  const sortedDates = Object.keys(dailyPnL).sort();
-
-  return {
-    trades, dailyPnL, totalPnL, grossProfit, grossLoss,
-    wins, losses, winRate, profitFactor, symbols,
-    totalTrades: trades.length,
-    firstDate: sortedDates[0] || "",
-    lastDate:  sortedDates[sortedDates.length - 1] || "",
-  };
+// ─── mtapi.io helpers ─────────────────────────────────────────────────────────
+async function mtConnect(login, password, server) {
+  const url = `${MTAPI_BASE}/ConnectEx?user=${login}&password=${encodeURIComponent(password)}&server=${encodeURIComponent(server)}&downloadOrderHistory=true&connectTimeoutSeconds=60`;
+  const res = await fetch(url, { headers: { accept: "text/plain" } });
+  if (!res.ok) throw new Error("No se pudo conectar al broker");
+  const token = await res.text();
+  if (!token || token.includes("error") || token.includes("Error")) throw new Error("Credenciales incorrectas");
+  return token.trim();
 }
 
-// ─── Import Modal ─────────────────────────────────────────────────────────────
-function ImportModal({ open, onClose, onImported, userId, t }) {
-  const [step,      setStep]      = useState(1);
-  const [parsed,    setParsed]    = useState(null);
-  const [accName,   setAccName]   = useState("");
-  const [provider,  setProvider]  = useState("");
-  const [type,      setType]      = useState("Capital Propio");
-  const [cost,      setCost]      = useState("0");
-  const [withdrawn, setWithdrawn] = useState("0");
-  const [iniBalance,setIniBalance]= useState("");
-  const [color,     setColor]     = useState("#0ea5e9");
-  const [loading,   setLoading]   = useState(false);
-  const [error,     setError]     = useState("");
-  const fileRef = useRef();
+async function mtGetBalance(token) {
+  const res = await fetch(`${MTAPI_BASE}/AccountSummary?id=${token}`, { headers: { accept: "application/json" } });
+  if (!res.ok) throw new Error("Error obteniendo balance");
+  return await res.json();
+}
 
-  const reset = () => {
-    setStep(1); setParsed(null); setAccName(""); setProvider("");
-    setType("Capital Propio"); setCost("0"); setWithdrawn("0");
-    setIniBalance(""); setColor("#0ea5e9"); setLoading(false); setError("");
-  };
+async function mtWaitForHistory(token, maxWait = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWait) {
+    const res = await fetch(`${MTAPI_BASE}/OrderHistoryDownloadComplete?id=${token}`, { headers: { accept: "application/json" } });
+    const data = await res.json();
+    if (data === true) return true;
+    await new Promise(r => setTimeout(r, 3000));
+  }
+  return false;
+}
 
-  const handleFile = (e) => {
-    const f = e.target.files[0];
-    if (!f) return;
-    setError("");
+async function mtGetOrders(token, from, to) {
+  const fromStr = from.toISOString().slice(0, 19);
+  const toStr   = to.toISOString().slice(0, 19);
+  const res = await fetch(`${MTAPI_BASE}/OrderHistory?id=${token}&from=${fromStr}&to=${toStr}`, { headers: { accept: "application/json" } });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data?.orders || [];
+}
 
-    // Try multiple encodings
-    const tryParse = (text) => {
-      const result = parseMT5Report(text);
-      if (result && result.totalTrades > 0) {
-        setParsed(result);
-        // Auto-suggest name
-        const nameGuess = f.name.replace(/ReportHistory-?/, "").replace(/\.[^.]+$/, "");
-        setAccName(nameGuess ? `Cuenta ${nameGuess}` : "Mi cuenta MT5");
-        setStep(2);
-        return true;
-      }
-      return false;
-    };
+function groupOrdersByDay(orders) {
+  const daily = {};
+  for (const o of orders) {
+    if (!o.closeTime) continue;
+    const date = o.closeTime.slice(0, 10);
+    if (!daily[date]) daily[date] = { pnl: 0, trades: 0, wins: 0 };
+    const net = (o.profit || 0) + (o.commission || 0) + (o.swap || 0) + (o.fee || 0);
+    daily[date].pnl    += net;
+    daily[date].trades += 1;
+    if (net > 0) daily[date].wins += 1;
+  }
+  return daily;
+}
 
-    // First try UTF-16 (most common for MT5)
-    const readerUtf16 = new FileReader();
-    readerUtf16.onload = (ev) => {
-      if (tryParse(ev.target.result)) return;
-      // Fallback: try UTF-8
-      const readerUtf8 = new FileReader();
-      readerUtf8.onload = (ev2) => {
-        if (!tryParse(ev2.target.result)) {
-          setError("No se encontraron trades. Asegúrate de exportar el 'Informe detallado' (no el extracto) desde MT5.");
-        }
-      };
-      readerUtf8.readAsText(f, "UTF-8");
-    };
-    readerUtf16.readAsText(f, "UTF-16");
-  };
+// ─── MT5 Connect Modal ────────────────────────────────────────────────────────
+function ConnectMT5Modal({ open, onClose, onConnected, userId, t }) {
+  const [step,     setStep]     = useState(1);
+  const [login,    setLogin]    = useState("");
+  const [password, setPassword] = useState("");
+  const [server,   setServer]   = useState("");
+  const [name,     setName]     = useState("");
+  const [provider, setProvider] = useState("");
+  const [type,     setType]     = useState("Fondeo");
+  const [cost,     setCost]     = useState("0");
+  const [withdrawn,setWithdrawn]= useState("0");
+  const [color,    setColor]    = useState("#0ea5e9");
+  const [loading,  setLoading]  = useState(false);
+  const [status,   setStatus]   = useState("");
+  const [error,    setError]    = useState("");
 
-  const handleImport = async () => {
-    if (!accName || !iniBalance) { setError("Completa nombre y balance inicial."); return; }
-    setLoading(true); setError("");
+  const reset = () => { setStep(1);setLogin("");setPassword("");setServer("");setName("");setProvider("");setType("Fondeo");setCost("0");setWithdrawn("0");setColor("#0ea5e9");setLoading(false);setStatus("");setError(""); };
+
+  const handleConnect = async () => {
+    if (!name||!login||!password||!server) { setError("Completa todos los campos."); return; }
+    setError(""); setLoading(true);
+
     try {
-      const initBal = parseFloat(iniBalance) || 0;
-      const currBal = Math.round((initBal + parsed.totalPnL) * 100) / 100;
+      // 1. Connect to MT5
+      setStatus("Conectando con el broker...");
+      const token = await mtConnect(login, password, server);
 
+      // 2. Get balance
+      setStatus("Obteniendo balance...");
+      const summary = await mtGetBalance(token);
+      const currentBalance = summary.balance || 0;
+
+      // 3. Wait for history
+      setStatus("Descargando historial (30-60s)...");
+      const ready = await mtWaitForHistory(token, 60000);
+
+      // 4. Get orders for last 6 months
+      setStatus("Procesando trades...");
+      const from = new Date(); from.setMonth(from.getMonth() - 6);
+      const to   = new Date();
+      const orders = await mtGetOrders(token, from, to);
+      const dailyPnL = groupOrdersByDay(orders);
+
+      // 5. Save account to Supabase
+      setStatus("Guardando cuenta...");
       const { data: acc, error: accErr } = await supabase.from("mt_accounts").insert({
-        user_id: userId, name: accName, provider, type,
-        cost: parseFloat(cost) || 0, withdrawn: parseFloat(withdrawn) || 0,
+        user_id: userId, name, provider, type,
+        cost: parseFloat(cost)||0, withdrawn: parseFloat(withdrawn)||0,
         color, status: "Live",
-        initial_balance: initBal,
-        current_balance: currBal,
-        start_date: parsed.firstDate || new Date().toISOString().split("T")[0],
-        login: "imported", server: "MT5-Import",
+        login, server,
+        initial_balance: currentBalance - Object.values(dailyPnL).reduce((s,d)=>s+d.pnl,0),
+        current_balance: currentBalance,
+        last_sync: new Date().toISOString(),
+        metaapi_account_id: token, // reuse field for mtapi token
+        start_date: new Date().toISOString().split("T")[0],
       }).select().single();
 
       if (accErr) throw accErr;
 
-      // Insert daily P&L
-      const pnlRows = Object.entries(parsed.dailyPnL).map(([date, d]) => ({
-        user_id:     userId,
-        account_id:  acc.id,
-        date,
-        pnl:         Math.round(d.pnl * 100) / 100,
-        trades_count: d.trades,
+      // 6. Save daily P&L
+      const pnlRows = Object.entries(dailyPnL).map(([date,d])=>({
+        user_id: userId, account_id: acc.id, date,
+        pnl: Math.round(d.pnl*100)/100, trades_count: d.trades,
       }));
-
       if (pnlRows.length > 0) {
-        const { error: pnlErr } = await supabase.from("daily_pnl")
-          .upsert(pnlRows, { onConflict: "account_id,date" });
-        if (pnlErr) throw pnlErr;
+        await supabase.from("daily_pnl").upsert(pnlRows, { onConflict: "account_id,date" });
       }
 
-      onImported();
-      onClose();
-      reset();
-    } catch (e) {
-      setError(e.message || "Error importando");
+      setStatus("✅ ¡Cuenta conectada!");
+      setTimeout(() => { onConnected(); onClose(); reset(); }, 1500);
+
+    } catch(e) {
+      setError(e.message || "Error conectando");
       setLoading(false);
+      setStatus("");
+    }
+  };
+
+  const handleSync = async (acc) => {
+    try {
+      setLoading(true);
+      setStatus("Reconectando...");
+      const token = await mtConnect(acc.login, acc.investor_password, acc.server);
+      setStatus("Obteniendo balance...");
+      const summary = await mtGetBalance(token);
+      setStatus("Descargando trades...");
+      await mtWaitForHistory(token, 45000);
+      const from = new Date(); from.setMonth(from.getMonth() - 1);
+      const orders = await mtGetOrders(token, from, new Date());
+      const dailyPnL = groupOrdersByDay(orders);
+      await supabase.from("mt_accounts").update({
+        current_balance: summary.balance,
+        last_sync: new Date().toISOString(),
+        metaapi_account_id: token,
+      }).eq("id", acc.id);
+      const pnlRows = Object.entries(dailyPnL).map(([date,d])=>({
+        user_id: userId, account_id: acc.id, date,
+        pnl: Math.round(d.pnl*100)/100, trades_count: d.trades,
+      }));
+      if (pnlRows.length > 0) await supabase.from("daily_pnl").upsert(pnlRows, { onConflict:"account_id,date" });
+      setStatus("✅ Sincronizado");
+      setTimeout(()=>{ onConnected(); onClose(); reset(); }, 1000);
+    } catch(e) {
+      setError(e.message);
+      setLoading(false);
+      setStatus("");
     }
   };
 
   if (!open) return null;
   return (
     <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,backdropFilter:"blur(6px)"}}>
-      <div onClick={e=>e.stopPropagation()} style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:20,padding:32,width:"min(560px,93vw)",maxHeight:"90vh",overflowY:"auto"}}>
+      <div onClick={e=>e.stopPropagation()} style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:20,padding:32,width:"min(540px,93vw)",maxHeight:"90vh",overflowY:"auto"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
           <div>
-            <h2 style={{fontSize:17,fontWeight:700,color:t.text}}>Importar reporte MT5</h2>
-            <p style={{fontSize:12,color:t.textMuted,marginTop:3}}>Sube el HTML exportado desde MetaTrader 5</p>
+            <h2 style={{fontSize:17,fontWeight:700,color:t.text}}>Conectar cuenta MT5</h2>
+            <p style={{fontSize:12,color:t.textMuted,marginTop:3}}>Conexión directa · datos en tiempo real</p>
           </div>
           <button onClick={()=>{onClose();reset();}} style={{background:"none",border:"none",color:t.textMuted,fontSize:22,cursor:"pointer"}}>✕</button>
         </div>
 
-        {/* Steps indicator */}
+        {/* Steps */}
         <div style={{display:"flex",gap:8,marginBottom:24}}>
-          {["Archivo","Configurar"].map((s,i)=>(
+          {["Credenciales","Detalles"].map((s,i)=>(
             <div key={s} style={{flex:1,textAlign:"center"}}>
               <div style={{height:3,borderRadius:2,background:step>i?"#0ea5e9":t.border,marginBottom:6,transition:"background 0.3s"}}/>
               <span style={{fontSize:10,color:step>i?"#0ea5e9":t.textMuted,fontWeight:step>i?700:400}}>{s}</span>
@@ -226,90 +199,59 @@ function ImportModal({ open, onClose, onImported, userId, t }) {
           ))}
         </div>
 
-        {/* STEP 1 */}
         {step===1&&(
           <div>
-            <div onClick={()=>fileRef.current?.click()}
-              style={{border:`2px dashed ${t.border}`,borderRadius:14,padding:"48px 24px",textAlign:"center",cursor:"pointer",background:t.surfaceAlt,transition:"border-color 0.2s"}}
-              onMouseEnter={e=>e.currentTarget.style.borderColor="#0ea5e9"}
-              onMouseLeave={e=>e.currentTarget.style.borderColor=t.border}>
-              <div style={{fontSize:40,marginBottom:12}}>📄</div>
-              <div style={{fontSize:15,fontWeight:700,color:t.text,marginBottom:6}}>Haz clic para subir el archivo HTML</div>
-              <div style={{fontSize:12,color:t.textMuted}}>Reporte exportado desde MT5 · Formato .html</div>
-              <input ref={fileRef} type="file" accept=".html,.htm" onChange={handleFile} style={{display:"none"}}/>
+            <div style={{background:"rgba(14,165,233,0.06)",border:"1px solid rgba(14,165,233,0.2)",borderRadius:10,padding:"12px 16px",marginBottom:20}}>
+              <div style={{fontSize:12,fontWeight:700,color:"#0ea5e9",marginBottom:4}}>🔗 Conexión directa a MT5</div>
+              <div style={{fontSize:11,color:t.textMuted,lineHeight:1.6}}>Puedes usar tu contraseña principal o de inversor. La conexión es de solo lectura para el historial.</div>
             </div>
-            {error&&<div style={{marginTop:12,background:t.negLight,border:`1px solid ${t.negative}30`,borderRadius:9,padding:"10px 14px",fontSize:12,color:t.negative}}>{error}</div>}
-            <div style={{marginTop:16,background:t.surfaceAlt,borderRadius:10,padding:"14px 16px",border:`1px solid ${t.border}`}}>
-              <div style={{fontSize:11,fontWeight:700,color:t.textSub,marginBottom:8}}>📋 Cómo exportar desde MT5:</div>
-              <div style={{fontSize:12,color:t.textMuted,lineHeight:1.8}}>
-                1. Abre <b style={{color:t.textSub}}>MetaTrader 5</b><br/>
-                2. Ve a la pestaña <b style={{color:t.textSub}}>"Historial de cuenta"</b> (panel inferior)<br/>
-                3. Clic derecho → <b style={{color:t.textSub}}>"Guardar como informe detallado"</b><br/>
-                4. Guarda como <b style={{color:t.textSub}}>HTML</b> y súbelo aquí
+            {[
+              {label:"Número de cuenta (Login)",val:login,set:setLogin,ph:"60228868",type:"text"},
+              {label:"Contraseña",val:password,set:setPassword,ph:"••••••••",type:"password"},
+              {label:"Nombre del servidor",val:server,set:setServer,ph:"Axi-US52-Live, FTMO-Server4...",type:"text"},
+            ].map(f=>(
+              <div key={f.label} style={{marginBottom:12}}>
+                <label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>{f.label}</label>
+                <input value={f.val} onChange={e=>f.set(e.target.value)} type={f.type} placeholder={f.ph}
+                  style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"10px 14px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/>
               </div>
-            </div>
+            ))}
+            {error&&<div style={{background:t.negLight,border:`1px solid ${t.negative}30`,borderRadius:9,padding:"10px 14px",fontSize:12,color:t.negative,marginBottom:12}}>{error}</div>}
+            <button onClick={()=>{if(!login||!password||!server){setError("Completa todos los campos.");return;}setError("");setStep(2);}} style={{width:"100%",padding:"11px",borderRadius:9,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}}>
+              Siguiente →
+            </button>
           </div>
         )}
 
-        {/* STEP 2 */}
-        {step===2&&parsed&&(
+        {step===2&&(
           <div>
-            {/* Preview stats */}
-            <div style={{background:t.surfaceAlt,borderRadius:12,padding:16,marginBottom:20,border:`1px solid ${t.border}`}}>
-              <div style={{fontSize:11,fontWeight:700,color:t.positive,marginBottom:10,textTransform:"uppercase",letterSpacing:"0.08em"}}>✅ {parsed.totalTrades} trades encontrados</div>
-              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
-                {[
-                  {l:"Trades",v:parsed.totalTrades},
-                  {l:"Win Rate",v:fmtPct(parsed.winRate)},
-                  {l:"Profit Factor",v:fmt(parsed.profitFactor)},
-                  {l:"Gross Profit",v:fmtUSD(parsed.grossProfit)},
-                  {l:"Gross Loss",v:fmtUSD(parsed.grossLoss)},
-                  {l:"P&L Neto",v:fmtUSD(parsed.totalPnL)},
-                  {l:"Desde",v:parsed.firstDate},
-                  {l:"Hasta",v:parsed.lastDate},
-                  {l:"Símbolos",v:parsed.symbols.slice(0,3).join(", ")+(parsed.symbols.length>3?"...":"")},
-                ].map(s=>(
-                  <div key={s.l} style={{background:t.surface,borderRadius:8,padding:"8px 10px",border:`1px solid ${t.border}`}}>
-                    <div style={{fontSize:9,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:3}}>{s.l}</div>
-                    <div style={{fontSize:12,fontWeight:700,color:t.text}}>{s.v}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* Config fields */}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 14px"}}>
               <div style={{gridColumn:"1/-1",marginBottom:12}}>
                 <label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Nombre de la cuenta</label>
-                <input value={accName} onChange={e=>setAccName(e.target.value)} placeholder="AXI Capital Propio"
-                  style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"9px 13px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/>
+                <input value={name} onChange={e=>setName(e.target.value)} placeholder="Ej: AXI Capital Propio"
+                  style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"10px 14px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/>
               </div>
               <div style={{marginBottom:12}}>
-                <label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Broker / Proveedor</label>
-                <input value={provider} onChange={e=>setProvider(e.target.value)} placeholder="AXI"
-                  style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"9px 13px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/>
+                <label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Proveedor</label>
+                <input value={provider} onChange={e=>setProvider(e.target.value)} placeholder="AXI, FTMO..."
+                  style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"10px 14px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/>
               </div>
               <div style={{marginBottom:12}}>
                 <label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Tipo</label>
                 <select value={type} onChange={e=>setType(e.target.value)}
-                  style={{width:"100%",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"9px 13px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}>
-                  <option>Capital Propio</option><option>Fondeo</option><option>Futuros</option><option>Otro</option>
+                  style={{width:"100%",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"10px 14px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}>
+                  <option>Fondeo</option><option>Capital Propio</option><option>Futuros</option><option>Otro</option>
                 </select>
-              </div>
-              <div style={{marginBottom:12}}>
-                <label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Balance inicial ($)</label>
-                <input value={iniBalance} onChange={e=>setIniBalance(e.target.value)} type="number" placeholder="5000"
-                  style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"9px 13px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/>
               </div>
               <div style={{marginBottom:12}}>
                 <label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Inversión / Costo ($)</label>
                 <input value={cost} onChange={e=>setCost(e.target.value)} type="number" placeholder="0"
-                  style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"9px 13px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/>
+                  style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"10px 14px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/>
               </div>
-              <div style={{marginBottom:12}}>
+              <div style={{marginBottom:16}}>
                 <label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Total retirado ($)</label>
                 <input value={withdrawn} onChange={e=>setWithdrawn(e.target.value)} type="number" placeholder="0"
-                  style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"9px 13px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/>
+                  style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"10px 14px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/>
               </div>
               <div style={{marginBottom:16,gridColumn:"1/-1"}}>
                 <label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:6,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Color</label>
@@ -319,22 +261,20 @@ function ImportModal({ open, onClose, onImported, userId, t }) {
               </div>
             </div>
 
-            {/* Balance preview */}
-            {iniBalance&&(
-              <div style={{background:`${color}12`,border:`1px solid ${color}30`,borderRadius:10,padding:"12px 16px",marginBottom:16}}>
-                <div style={{fontSize:11,color:t.textMuted,marginBottom:4}}>Balance actual calculado</div>
-                <div style={{fontSize:20,fontWeight:700,color:parsed.totalPnL>=0?t.positive:t.negative}}>{fmtUSD((parseFloat(iniBalance)||0)+parsed.totalPnL)}</div>
-                <div style={{fontSize:11,color:t.textMuted,marginTop:2}}>{fmtUSD(parseFloat(iniBalance)||0)} inicial + {fmtUSD(parsed.totalPnL)} P&L neto</div>
+            {error&&<div style={{background:t.negLight,border:`1px solid ${t.negative}30`,borderRadius:9,padding:"10px 14px",fontSize:12,color:t.negative,marginBottom:12}}>{error}</div>}
+
+            {status&&(
+              <div style={{background:"rgba(14,165,233,0.08)",border:"1px solid rgba(14,165,233,0.25)",borderRadius:9,padding:"10px 14px",fontSize:12,color:"#0ea5e9",marginBottom:14,display:"flex",alignItems:"center",gap:8}}>
+                <span style={{animation:"spin 1s linear infinite",display:"inline-block"}}>⟳</span>
+                {status}
               </div>
             )}
 
-            {error&&<div style={{background:t.negLight,border:`1px solid ${t.negative}30`,borderRadius:9,padding:"10px 14px",fontSize:12,color:t.negative,marginBottom:12}}>{error}</div>}
-
             <div style={{display:"flex",gap:9}}>
-              <button onClick={()=>setStep(1)} style={{flex:1,padding:"11px",borderRadius:9,border:`1px solid ${t.border}`,background:"transparent",color:t.textSub,fontSize:13,fontWeight:600,cursor:"pointer"}}>← Volver</button>
-              <button onClick={handleImport} disabled={loading||!accName||!iniBalance}
-                style={{flex:2,padding:"11px",borderRadius:9,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontSize:13,fontWeight:700,cursor:loading?"wait":"pointer",opacity:loading||!accName||!iniBalance?0.6:1}}>
-                {loading?`Importando ${parsed.totalTrades} trades...`:`📥 Importar ${parsed.totalTrades} trades`}
+              <button onClick={()=>{setStep(1);setError("");}} style={{flex:1,padding:"11px",borderRadius:9,border:`1px solid ${t.border}`,background:"transparent",color:t.textSub,fontSize:13,fontWeight:600,cursor:"pointer"}}>← Volver</button>
+              <button onClick={handleConnect} disabled={loading||!name}
+                style={{flex:2,padding:"11px",borderRadius:9,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontSize:13,fontWeight:700,cursor:loading?"wait":"pointer",opacity:loading||!name?0.6:1}}>
+                {loading?"Conectando...":"🔗 Conectar cuenta"}
               </button>
             </div>
           </div>
@@ -344,7 +284,117 @@ function ImportModal({ open, onClose, onImported, userId, t }) {
   );
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── CSV Import Modal ─────────────────────────────────────────────────────────
+function parseMT5Report(htmlText) {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(htmlText, "text/html");
+  const rows = doc.querySelectorAll("tr");
+  const trades = [];
+  let inPositions = false;
+  for (const row of rows) {
+    const rowText = row.textContent;
+    if (!inPositions) { if (rowText.includes("Positions")) inPositions = true; continue; }
+    if (rowText.includes("Orders") || rowText.includes("Deals")) break;
+    const cells = row.querySelectorAll("td");
+    if (cells.length < 14) continue;
+    const openTime = cells[0]?.textContent?.trim();
+    if (!openTime || !/^\d{4}\.\d{2}\.\d{2}/.test(openTime)) continue;
+    try {
+      const closeTime  = cells[9]?.textContent?.trim() || "";
+      const commission = parseFloat(cells[11]?.textContent?.trim()) || 0;
+      const swap       = parseFloat(cells[12]?.textContent?.trim()) || 0;
+      const profitRaw  = (cells[13]?.textContent || "0").replace(/[\s\u00a0]/g, "");
+      const profit     = parseFloat(profitRaw) || 0;
+      const net        = profit + commission + swap;
+      const closeDate  = closeTime.slice(0,10).replace(/\./g,"-");
+      const openDate   = openTime.slice(0,10).replace(/\./g,"-");
+      if (!closeDate || closeDate.length < 10) continue;
+      trades.push({ openDate, closeDate, symbol:cells[2]?.textContent?.trim()||"", type:cells[3]?.textContent?.trim()||"", commission, swap, profit, net });
+    } catch { continue; }
+  }
+  if (trades.length === 0) return null;
+  const dailyPnL = {};
+  for (const t of trades) {
+    if (!dailyPnL[t.closeDate]) dailyPnL[t.closeDate] = { pnl:0, trades:0, wins:0 };
+    dailyPnL[t.closeDate].pnl    += t.net;
+    dailyPnL[t.closeDate].trades += 1;
+    if (t.net > 0) dailyPnL[t.closeDate].wins += 1;
+  }
+  const totalPnL=trades.reduce((s,t)=>s+t.net,0), grossProfit=trades.filter(t=>t.net>0).reduce((s,t)=>s+t.net,0), grossLoss=trades.filter(t=>t.net<0).reduce((s,t)=>s+t.net,0);
+  const wins=trades.filter(t=>t.net>0).length, winRate=trades.length>0?(wins/trades.length)*100:0, profitFactor=Math.abs(grossLoss)>0?grossProfit/Math.abs(grossLoss):0;
+  const symbols=[...new Set(trades.map(t=>t.symbol))], sortedDates=Object.keys(dailyPnL).sort();
+  return { trades, dailyPnL, totalPnL, grossProfit, grossLoss, wins, losses:trades.length-wins, winRate, profitFactor, symbols, totalTrades:trades.length, firstDate:sortedDates[0]||"", lastDate:sortedDates[sortedDates.length-1]||"" };
+}
+
+function ImportModal({ open, onClose, onImported, userId, t }) {
+  const [step,setStep]=useState(1),[parsed,setParsed]=useState(null),[accName,setAccName]=useState(""),[provider,setProvider]=useState(""),[type,setType]=useState("Capital Propio"),[cost,setCost]=useState("0"),[withdrawn,setWithdrawn]=useState("0"),[iniBalance,setIniBalance]=useState(""),[color,setColor]=useState("#0ea5e9"),[loading,setLoading]=useState(false),[error,setError]=useState("");
+  const fileRef=useRef();
+  const reset=()=>{setStep(1);setParsed(null);setAccName("");setProvider("");setType("Capital Propio");setCost("0");setWithdrawn("0");setIniBalance("");setColor("#0ea5e9");setLoading(false);setError("");};
+  const handleFile=(e)=>{
+    const f=e.target.files[0]; if(!f) return; setError("");
+    const tryParse=(text)=>{ const r=parseMT5Report(text); if(r&&r.totalTrades>0){setParsed(r);setAccName(f.name.replace(/ReportHistory-?/,"").replace(/\.[^.]+$/,""));setStep(2);return true;}return false;};
+    const r1=new FileReader(); r1.onload=(ev)=>{ if(tryParse(ev.target.result))return; const r2=new FileReader(); r2.onload=(ev2)=>{if(!tryParse(ev2.target.result))setError("No se encontraron trades. Exporta el 'Informe detallado' desde MT5.");};r2.readAsText(f,"UTF-8");};r1.readAsText(f,"UTF-16");
+  };
+  const handleImport=async()=>{
+    if(!accName||!iniBalance){setError("Completa nombre y balance inicial.");return;} setLoading(true);setError("");
+    try{
+      const initBal=parseFloat(iniBalance)||0, currBal=Math.round((initBal+parsed.totalPnL)*100)/100;
+      const{data:acc,error:accErr}=await supabase.from("mt_accounts").insert({user_id:userId,name:accName,provider,type,cost:parseFloat(cost)||0,withdrawn:parseFloat(withdrawn)||0,color,status:"Live",initial_balance:initBal,current_balance:currBal,start_date:parsed.firstDate||new Date().toISOString().split("T")[0],login:"imported",server:"MT5-Import"}).select().single();
+      if(accErr)throw accErr;
+      const pnlRows=Object.entries(parsed.dailyPnL).map(([date,d])=>({user_id:userId,account_id:acc.id,date,pnl:Math.round(d.pnl*100)/100,trades_count:d.trades}));
+      if(pnlRows.length>0){const{error:pnlErr}=await supabase.from("daily_pnl").upsert(pnlRows,{onConflict:"account_id,date"});if(pnlErr)throw pnlErr;}
+      onImported();onClose();reset();
+    }catch(e){setError(e.message||"Error importando");setLoading(false);}
+  };
+  if(!open) return null;
+  return(
+    <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,backdropFilter:"blur(6px)"}}>
+      <div onClick={e=>e.stopPropagation()} style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:20,padding:32,width:"min(560px,93vw)",maxHeight:"90vh",overflowY:"auto"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+          <div><h2 style={{fontSize:17,fontWeight:700,color:t.text}}>Importar reporte MT5</h2><p style={{fontSize:12,color:t.textMuted,marginTop:3}}>Sube el HTML exportado desde MetaTrader 5</p></div>
+          <button onClick={()=>{onClose();reset();}} style={{background:"none",border:"none",color:t.textMuted,fontSize:22,cursor:"pointer"}}>✕</button>
+        </div>
+        <div style={{display:"flex",gap:8,marginBottom:24}}>
+          {["Archivo","Configurar"].map((s,i)=>(<div key={s} style={{flex:1,textAlign:"center"}}><div style={{height:3,borderRadius:2,background:step>i?"#0ea5e9":t.border,marginBottom:6}}/><span style={{fontSize:10,color:step>i?"#0ea5e9":t.textMuted,fontWeight:step>i?700:400}}>{s}</span></div>))}
+        </div>
+        {step===1&&(<div>
+          <div onClick={()=>fileRef.current?.click()} style={{border:`2px dashed ${t.border}`,borderRadius:14,padding:"48px 24px",textAlign:"center",cursor:"pointer",background:t.surfaceAlt}} onMouseEnter={e=>e.currentTarget.style.borderColor="#0ea5e9"} onMouseLeave={e=>e.currentTarget.style.borderColor=t.border}>
+            <div style={{fontSize:40,marginBottom:12}}>📄</div>
+            <div style={{fontSize:15,fontWeight:700,color:t.text,marginBottom:6}}>Haz clic para subir el archivo HTML</div>
+            <div style={{fontSize:12,color:t.textMuted}}>Historial → clic derecho → "Guardar como informe detallado"</div>
+            <input ref={fileRef} type="file" accept=".html,.htm" onChange={handleFile} style={{display:"none"}}/>
+          </div>
+          {error&&<div style={{marginTop:12,background:t.negLight,border:`1px solid ${t.negative}30`,borderRadius:9,padding:"10px 14px",fontSize:12,color:t.negative}}>{error}</div>}
+        </div>)}
+        {step===2&&parsed&&(<div>
+          <div style={{background:t.surfaceAlt,borderRadius:12,padding:16,marginBottom:20,border:`1px solid ${t.border}`}}>
+            <div style={{fontSize:11,fontWeight:700,color:t.positive,marginBottom:10}}>✅ {parsed.totalTrades} trades encontrados</div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+              {[{l:"Win Rate",v:fmtPct(parsed.winRate)},{l:"Profit Factor",v:fmt(parsed.profitFactor)},{l:"P&L Neto",v:fmtUSD(parsed.totalPnL)},{l:"Desde",v:parsed.firstDate},{l:"Hasta",v:parsed.lastDate},{l:"Símbolos",v:parsed.symbols.slice(0,2).join(", ")}].map(s=>(<div key={s.l} style={{background:t.surface,borderRadius:8,padding:"8px 10px",border:`1px solid ${t.border}`}}><div style={{fontSize:9,color:t.textMuted,marginBottom:3}}>{s.l}</div><div style={{fontSize:12,fontWeight:700,color:t.text}}>{s.v}</div></div>))}
+            </div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 14px"}}>
+            <div style={{gridColumn:"1/-1",marginBottom:12}}><label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Nombre</label><input value={accName} onChange={e=>setAccName(e.target.value)} style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"9px 13px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/></div>
+            <div style={{marginBottom:12}}><label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Broker</label><input value={provider} onChange={e=>setProvider(e.target.value)} placeholder="AXI" style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"9px 13px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/></div>
+            <div style={{marginBottom:12}}><label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Tipo</label><select value={type} onChange={e=>setType(e.target.value)} style={{width:"100%",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"9px 13px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}><option>Capital Propio</option><option>Fondeo</option><option>Futuros</option><option>Otro</option></select></div>
+            <div style={{marginBottom:12}}><label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Balance inicial ($)</label><input value={iniBalance} onChange={e=>setIniBalance(e.target.value)} type="number" placeholder="5000" style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"9px 13px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/></div>
+            <div style={{marginBottom:12}}><label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Inversión ($)</label><input value={cost} onChange={e=>setCost(e.target.value)} type="number" placeholder="0" style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"9px 13px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/></div>
+            <div style={{marginBottom:16}}><label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Retirado ($)</label><input value={withdrawn} onChange={e=>setWithdrawn(e.target.value)} type="number" placeholder="0" style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"9px 13px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/></div>
+            <div style={{marginBottom:16,gridColumn:"1/-1"}}><label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:6,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Color</label><div style={{display:"flex",gap:8,flexWrap:"wrap"}}>{PALETTE.map(c=><div key={c} onClick={()=>setColor(c)} style={{width:26,height:26,borderRadius:"50%",background:c,cursor:"pointer",border:color===c?"3px solid #fff":"3px solid transparent",boxShadow:color===c?`0 0 0 2px ${c}`:"none"}}/>)}</div></div>
+          </div>
+          {iniBalance&&(<div style={{background:`${color}12`,border:`1px solid ${color}30`,borderRadius:10,padding:"12px 16px",marginBottom:16}}><div style={{fontSize:11,color:t.textMuted,marginBottom:4}}>Balance calculado</div><div style={{fontSize:20,fontWeight:700,color:parsed.totalPnL>=0?t.positive:t.negative}}>{fmtUSD((parseFloat(iniBalance)||0)+parsed.totalPnL)}</div></div>)}
+          {error&&<div style={{background:t.negLight,border:`1px solid ${t.negative}30`,borderRadius:9,padding:"10px 14px",fontSize:12,color:t.negative,marginBottom:12}}>{error}</div>}
+          <div style={{display:"flex",gap:9}}>
+            <button onClick={()=>setStep(1)} style={{flex:1,padding:"11px",borderRadius:9,border:`1px solid ${t.border}`,background:"transparent",color:t.textSub,fontSize:13,fontWeight:600,cursor:"pointer"}}>← Volver</button>
+            <button onClick={handleImport} disabled={loading||!accName||!iniBalance} style={{flex:2,padding:"11px",borderRadius:9,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontSize:13,fontWeight:700,cursor:loading?"wait":"pointer",opacity:loading||!accName||!iniBalance?0.6:1}}>{loading?`Importando...`:`📥 Importar ${parsed.totalTrades} trades`}</button>
+          </div>
+        </div>)}
+      </div>
+    </div>
+  );
+}
+
+// ─── Shared components ────────────────────────────────────────────────────────
 function Spark({ data, color, w=60, h=22 }) {
   if(!data||data.length<2) return null;
   const mn=Math.min(...data),mx=Math.max(...data),r=mx-mn||1;
@@ -357,7 +407,7 @@ function StatusBadge({status}) {
   return <span style={{fontSize:9,fontWeight:700,padding:"2px 8px",borderRadius:20,background:s.bg,color:s.c,border:`1px solid ${s.b}`,letterSpacing:"0.06em",textTransform:"uppercase"}}>{status}</span>;
 }
 function StatBox({label,value,sub,color,icon,t}) {
-  return (
+  return(
     <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:14,padding:"18px 20px"}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
         <span style={{fontSize:10,fontWeight:700,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.1em"}}>{label}</span>
@@ -368,9 +418,11 @@ function StatBox({label,value,sub,color,icon,t}) {
     </div>
   );
 }
-function AccountRow({ acc, expanded, onToggle, onDelete, t }) {
+
+function AccountRow({ acc, expanded, onToggle, onSync, onDelete, syncing, t }) {
   const pnl=acc.current_balance-acc.initial_balance, pct=acc.initial_balance>0?(pnl/acc.initial_balance)*100:0, pos=pnl>=0;
-  return (
+  const isLive = acc.login !== "imported";
+  return(
     <div style={{borderRadius:12,overflow:"hidden",border:`1px solid ${expanded?acc.color+"60":t.border}`,transition:"border-color 0.2s",marginBottom:6}}>
       <div onClick={onToggle} style={{display:"flex",alignItems:"center",gap:12,padding:"11px 16px",background:expanded?t.surfaceAlt:t.surface,cursor:"pointer",transition:"background 0.15s"}}
         onMouseEnter={e=>{if(!expanded)e.currentTarget.style.background=t.surfaceHover;}}
@@ -381,6 +433,8 @@ function AccountRow({ acc, expanded, onToggle, onDelete, t }) {
           <span style={{fontSize:11,color:t.textMuted,marginLeft:10}}>{acc.provider} · {acc.type}</span>
         </div>
         <StatusBadge status={acc.status}/>
+        {isLive&&<span style={{fontSize:10,color:"#22d07a",background:"rgba(34,208,122,0.1)",padding:"2px 8px",borderRadius:20,border:"1px solid rgba(34,208,122,0.2)"}}>🔗 Live</span>}
+        {!isLive&&<span style={{fontSize:10,color:"#0ea5e9",background:"rgba(14,165,233,0.1)",padding:"2px 8px",borderRadius:20,border:"1px solid rgba(14,165,233,0.2)"}}>📥 CSV</span>}
         <div style={{textAlign:"right",minWidth:100}}><div style={{fontSize:13,fontWeight:700,color:t.text}}>{fmtUSD(acc.current_balance)}</div></div>
         <div style={{minWidth:80,textAlign:"right"}}><span style={{fontSize:12,fontWeight:700,color:pos?t.positive:t.negative}}>{fmtPct(pct)}</span></div>
         <span style={{color:t.textMuted,fontSize:12,marginLeft:4,transition:"transform 0.2s",display:"inline-block",transform:expanded?"rotate(90deg)":"rotate(0deg)"}}>›</span>
@@ -395,11 +449,15 @@ function AccountRow({ acc, expanded, onToggle, onDelete, t }) {
               {l:"Inversión",v:fmtUSD(acc.cost),c:t.negative},
               {l:"Retirado",v:fmtUSD(acc.withdrawn),c:t.positive},
               {l:"Bficio neto",v:fmtUSD(acc.withdrawn-acc.cost),c:(acc.withdrawn-acc.cost)>=0?t.positive:t.negative},
-              {l:"Inicio",v:acc.start_date||"-",c:t.textSub},
-              {l:"Fuente",v:"📥 CSV importado",c:t.textSub},
-            ].map(s=>(<div key={s.l} style={{background:t.surface,borderRadius:8,padding:"8px 12px",border:`1px solid ${t.border}`}}><div style={{fontSize:9,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:3}}>{s.l}</div><div style={{fontSize:12,fontWeight:700,color:s.c}}>{s.v}</div></div>))}
+              isLive&&{l:"Login",v:acc.login,c:t.textSub},
+              isLive&&{l:"Servidor",v:acc.server,c:t.textSub},
+              isLive&&{l:"Última sync",v:acc.last_sync?new Date(acc.last_sync).toLocaleString("es"):"Nunca",c:t.textMuted},
+            ].filter(Boolean).map(s=>(<div key={s.l} style={{background:t.surface,borderRadius:8,padding:"8px 12px",border:`1px solid ${t.border}`}}><div style={{fontSize:9,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:3}}>{s.l}</div><div style={{fontSize:12,fontWeight:700,color:s.c}}>{s.v}</div></div>))}
           </div>
-          <button onClick={e=>{e.stopPropagation();onDelete(acc.id);}} style={{padding:"7px 14px",borderRadius:8,border:"none",background:t.negLight,color:t.negative,fontSize:12,cursor:"pointer"}}>🗑 Eliminar</button>
+          <div style={{display:"flex",gap:8}}>
+            {isLive&&<button onClick={e=>{e.stopPropagation();onSync(acc);}} disabled={syncing===acc.id} style={{padding:"7px 18px",borderRadius:8,border:"none",background:"rgba(14,165,233,0.15)",color:"#0ea5e9",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>{syncing===acc.id?"⟳ Sincronizando...":"🔄 Sincronizar"}</button>}
+            <button onClick={e=>{e.stopPropagation();onDelete(acc.id);}} style={{padding:"7px 14px",borderRadius:8,border:"none",background:t.negLight,color:t.negative,fontSize:12,cursor:"pointer"}}>🗑 Eliminar</button>
+          </div>
         </div>
       )}
     </div>
@@ -414,37 +472,29 @@ function PerformanceCalendar({ userId, accounts, t }) {
   const [editVal,setEditVal]=useState("");
   const [filterAcc,setFilterAcc]=useState("all");
   const [loading,setLoading]=useState(false);
-
   useEffect(()=>{
-    const fetch_ = async () => {
+    const fetch_=async()=>{
       setLoading(true);
-      const start=`${year}-${String(month+1).padStart(2,"0")}-01`;
-      const end=`${year}-${String(month+1).padStart(2,"0")}-${getDaysInMonth(year,month)}`;
+      const start=`${year}-${String(month+1).padStart(2,"0")}-01`, end=`${year}-${String(month+1).padStart(2,"0")}-${getDaysInMonth(year,month)}`;
       let q=supabase.from("daily_pnl").select("*").eq("user_id",userId).gte("date",start).lte("date",end);
       if(filterAcc!=="all") q=q.eq("account_id",filterAcc);
-      const {data}=await q;
-      const map={};
-      (data||[]).forEach(r=>{ map[r.date]=(map[r.date]||0)+r.pnl; });
-      setDailyData(map);
-      setLoading(false);
-    };
-    fetch_();
+      const{data}=await q;
+      const map={}; (data||[]).forEach(r=>{map[r.date]=(map[r.date]||0)+r.pnl;}); setDailyData(map); setLoading(false);
+    }; fetch_();
   },[year,month,filterAcc,userId]);
-
-  const days=getDaysInMonth(year,month), firstDay=getFirstDayOfMonth(year,month);
+  const days=getDaysInMonth(year,month),firstDay=getFirstDayOfMonth(year,month);
   const mk=(d)=>`${year}-${String(month+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
   const values=Array.from({length:days},(_,i)=>dailyData[mk(i+1)]??null);
   const maxAbs=Math.max(...values.filter(v=>v!==null).map(Math.abs),1);
   const monthTotal=values.filter(v=>v!==null).reduce((a,b)=>a+b,0);
-  const winD=values.filter(v=>v!==null&&v>0).length, lossD=values.filter(v=>v!==null&&v<0).length;
+  const winD=values.filter(v=>v!==null&&v>0).length,lossD=values.filter(v=>v!==null&&v<0).length;
   const MONTHS=["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
   const DAY_NAMES=["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"];
   const cellBg=(val)=>{if(val===null)return t.surfaceAlt;const i=Math.min(Math.abs(val)/maxAbs,1);return val>0?`rgba(34,208,122,${0.1+i*0.65})`:`rgba(240,71,106,${0.1+i*0.65})`;};
-
-  return (
+  return(
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20,flexWrap:"wrap",gap:12}}>
-        <div><h1 style={{fontSize:26,fontWeight:700,letterSpacing:"-0.03em",color:t.text}}>Calendario</h1><p style={{fontSize:12,color:t.textMuted,marginTop:3}}>P&L diario real · datos de tus cuentas importadas</p></div>
+        <div><h1 style={{fontSize:26,fontWeight:700,letterSpacing:"-0.03em",color:t.text}}>Calendario</h1><p style={{fontSize:12,color:t.textMuted,marginTop:3}}>P&L diario real de tus cuentas</p></div>
         <div style={{display:"flex",gap:8,alignItems:"center"}}>
           <button onClick={()=>{if(month===0){setMonth(11);setYear(y=>y-1)}else setMonth(m=>m-1)}} style={{padding:"6px 12px",borderRadius:8,border:`1px solid ${t.border}`,background:t.surface,color:t.text,cursor:"pointer",fontSize:14}}>‹</button>
           <span style={{fontSize:13,fontWeight:700,color:t.text,minWidth:130,textAlign:"center"}}>{MONTHS[month]} {year}</span>
@@ -457,26 +507,14 @@ function PerformanceCalendar({ userId, accounts, t }) {
         {accounts.map(a=>(<button key={a.id} onClick={()=>setFilterAcc(a.id)} style={{padding:"5px 12px",borderRadius:20,fontSize:11,fontWeight:600,cursor:"pointer",border:`1px solid ${filterAcc===a.id?a.color:t.border}`,background:filterAcc===a.id?a.color+"18":"transparent",color:filterAcc===a.id?a.color:t.textMuted,display:"flex",alignItems:"center",gap:5}}><span style={{width:6,height:6,borderRadius:"50%",background:a.color,display:"inline-block"}}/>{a.name}</button>))}
       </div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:18}}>
-        {[{l:"Total del mes",v:fmtUSD(monthTotal),c:monthTotal>=0?t.positive:t.negative},{l:"Días positivos",v:winD,c:t.positive},{l:"Días negativos",v:lossD,c:t.negative},{l:"Win rate",v:fmtPct((winD/(winD+lossD||1))*100),c:t.positive}].map(s=>(
-          <div key={s.l} style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:12,padding:"12px 16px"}}><div style={{fontSize:9,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.09em",marginBottom:4}}>{s.l}</div><div style={{fontSize:20,fontWeight:700,color:s.c,letterSpacing:"-0.02em"}}>{s.v}</div></div>
-        ))}
+        {[{l:"Total del mes",v:fmtUSD(monthTotal),c:monthTotal>=0?t.positive:t.negative},{l:"Días positivos",v:winD,c:t.positive},{l:"Días negativos",v:lossD,c:t.negative},{l:"Win rate",v:fmtPct((winD/(winD+lossD||1))*100),c:t.positive}].map(s=>(<div key={s.l} style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:12,padding:"12px 16px"}}><div style={{fontSize:9,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.09em",marginBottom:4}}>{s.l}</div><div style={{fontSize:20,fontWeight:700,color:s.c,letterSpacing:"-0.02em"}}>{s.v}</div></div>))}
       </div>
       <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:16,padding:20}}>
         {loading&&<div style={{textAlign:"center",padding:12,color:t.textMuted,fontSize:12}}>Cargando...</div>}
-        <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:5,marginBottom:8}}>
-          {DAY_NAMES.map(d=><div key={d} style={{textAlign:"center",fontSize:10,fontWeight:700,color:t.textMuted,padding:"3px 0",textTransform:"uppercase",letterSpacing:"0.07em"}}>{d}</div>)}
-        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:5,marginBottom:8}}>{DAY_NAMES.map(d=><div key={d} style={{textAlign:"center",fontSize:10,fontWeight:700,color:t.textMuted,padding:"3px 0",textTransform:"uppercase",letterSpacing:"0.07em"}}>{d}</div>)}</div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:5}}>
           {Array.from({length:firstDay}).map((_,i)=><div key={`e${i}`}/>)}
-          {Array.from({length:days}).map((_,i)=>{
-            const d=i+1,key=mk(d),val=dailyData[key]??null;
-            return(<div key={d} onClick={()=>{setEditDay(key);setEditVal(String(val??""));}}
-              style={{borderRadius:9,padding:"8px 6px",background:cellBg(val),border:`1px solid ${val!==null?(val>0?"rgba(34,208,122,0.25)":"rgba(240,71,106,0.25)"):t.border}`,cursor:"pointer",minHeight:56,transition:"opacity 0.12s"}}
-              onMouseEnter={e=>e.currentTarget.style.opacity="0.72"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>
-              <div style={{fontSize:10,fontWeight:600,color:t.textMuted,marginBottom:3}}>{d}</div>
-              {val!==null?<div style={{fontSize:11,fontWeight:700,color:val>=0?t.positive:t.negative,letterSpacing:"-0.01em"}}>{val>=0?"+":""}{fmt(val,0)}</div>:<div style={{fontSize:16,color:t.textMuted,opacity:0.18,textAlign:"center",marginTop:2}}>·</div>}
-            </div>);
-          })}
+          {Array.from({length:days}).map((_,i)=>{const d=i+1,key=mk(d),val=dailyData[key]??null;return(<div key={d} onClick={()=>{setEditDay(key);setEditVal(String(val??""));}} style={{borderRadius:9,padding:"8px 6px",background:cellBg(val),border:`1px solid ${val!==null?(val>0?"rgba(34,208,122,0.25)":"rgba(240,71,106,0.25)"):t.border}`,cursor:"pointer",minHeight:56,transition:"opacity 0.12s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.72"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}><div style={{fontSize:10,fontWeight:600,color:t.textMuted,marginBottom:3}}>{d}</div>{val!==null?<div style={{fontSize:11,fontWeight:700,color:val>=0?t.positive:t.negative,letterSpacing:"-0.01em"}}>{val>=0?"+":""}{fmt(val,0)}</div>:<div style={{fontSize:16,color:t.textMuted,opacity:0.18,textAlign:"center",marginTop:2}}>·</div>}</div>);})}
         </div>
         <div style={{display:"flex",alignItems:"center",gap:5,marginTop:12,justifyContent:"flex-end"}}>
           <span style={{fontSize:10,color:t.textMuted}}>Pérdida</span>
@@ -492,8 +530,8 @@ function PerformanceCalendar({ userId, accounts, t }) {
 }
 
 function LandingPage({ onGoToLogin }) {
-  const features=[{icon:"📊",title:"Dashboard Consolidado",desc:"Fondeo, capital propio y futuros en una sola vista."},{icon:"📥",title:"Importa tu historial MT5",desc:"Sube el reporte HTML y tu P&L diario aparece automáticamente."},{icon:"📅",title:"Calendario de P&L",desc:"Heatmap diario. Identifica tus mejores y peores días."},{icon:"🗂️",title:"Grupos y Familias",desc:"Organiza tus cuentas como quieras."},{icon:"📈",title:"ROI Real",desc:"Beneficio neto real: retirado menos invertido."},{icon:"🔒",title:"Multi-perfil",desc:"Cada usuario tiene su propio espacio privado."}];
-  return (
+  const features=[{icon:"🔗",title:"Conexión MT5 Real",desc:"Conecta directamente con tu broker. Balance y trades en tiempo real."},{icon:"📥",title:"Importa historial CSV",desc:"Sube el reporte HTML de MT5 y tu P&L diario aparece automáticamente."},{icon:"📅",title:"Calendario de P&L",desc:"Heatmap diario. Identifica tus mejores y peores días."},{icon:"📊",title:"Dashboard Consolidado",desc:"Todas tus cuentas en una sola vista — fondeo, propio y futuros."},{icon:"📈",title:"ROI Real",desc:"Beneficio neto real: retirado menos invertido."},{icon:"🔒",title:"Multi-perfil",desc:"Cada usuario tiene su propio espacio privado y seguro."}];
+  return(
     <div style={{minHeight:"100vh",background:"#080c14",color:"#e6eaf4",fontFamily:"'Plus Jakarta Sans',system-ui,sans-serif",overflowX:"hidden"}}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&family=Instrument+Serif:ital@0;1&display=swap');*{box-sizing:border-box;margin:0;padding:0}@keyframes fadeUp{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}@keyframes pulse{0%,100%{opacity:0.4}50%{opacity:0.8}}.fade-up{animation:fadeUp 0.7s ease forwards}.hero-btn:hover{transform:translateY(-2px);box-shadow:0 8px 32px rgba(14,165,233,0.4)}.feature-card:hover{transform:translateY(-4px);border-color:#0ea5e940}`}</style>
       <nav style={{position:"fixed",top:0,left:0,right:0,zIndex:100,padding:"16px 48px",display:"flex",justifyContent:"space-between",alignItems:"center",background:"rgba(8,12,20,0.92)",backdropFilter:"blur(12px)",borderBottom:"1px solid #141923"}}>
@@ -513,7 +551,7 @@ function LandingPage({ onGoToLogin }) {
           Controla cada cuenta.{" "}
           <span style={{fontFamily:"'Instrument Serif',serif",fontStyle:"italic",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>Mide tu verdadero ROI.</span>
         </h1>
-        <p className="fade-up" style={{fontSize:"clamp(15px,2vw,19px)",color:"#7d8fa8",maxWidth:560,lineHeight:1.65,marginBottom:40,animationDelay:"0.3s"}}>Importa tu historial de MT5 y visualiza todo tu rendimiento real en segundos.</p>
+        <p className="fade-up" style={{fontSize:"clamp(15px,2vw,19px)",color:"#7d8fa8",maxWidth:560,lineHeight:1.65,marginBottom:40,animationDelay:"0.3s"}}>Conecta tus cuentas MT5 en vivo o importa tu historial. Todo en un dashboard profesional.</p>
         <div className="fade-up" style={{display:"flex",gap:12,justifyContent:"center",animationDelay:"0.4s"}}>
           <button className="hero-btn" onClick={onGoToLogin} style={{padding:"14px 32px",borderRadius:12,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontSize:15,fontWeight:700,cursor:"pointer",transition:"all 0.2s",fontFamily:"inherit"}}>Entrar al dashboard →</button>
         </div>
@@ -533,24 +571,10 @@ function LandingPage({ onGoToLogin }) {
 }
 
 function LoginPage({ onLogin, onBack }) {
-  const [mode,setMode]=useState("login");
-  const [email,setEmail]=useState(""), [password,setPassword]=useState(""), [name,setName]=useState("");
-  const [error,setError]=useState(""), [loading,setLoading]=useState(false), [showPass,setShowPass]=useState(false);
-  const handleLogin = async () => {
-    setError(""); if(!email||!password){setError("Completa todos los campos.");return;} setLoading(true);
-    const {data,error:e}=await supabase.auth.signInWithPassword({email,password});
-    if(e){setError("Correo o contraseña incorrectos.");setLoading(false);return;}
-    const {data:prof}=await supabase.from("profiles").select("*").eq("id",data.user.id).single();
-    onLogin({...data.user,name:prof?.name||email,avatar:prof?.avatar||email.slice(0,2).toUpperCase()});
-  };
-  const handleRegister = async () => {
-    setError(""); if(!name||!email||!password){setError("Completa todos los campos.");return;}
-    if(password.length<8){setError("La contraseña debe tener al menos 8 caracteres.");return;} setLoading(true);
-    const {data,error:e}=await supabase.auth.signUp({email,password,options:{data:{name,avatar:name.split(" ").map(w=>w[0]).join("").toUpperCase().slice(0,2)}}});
-    if(e){setError(e.message);setLoading(false);return;}
-    onLogin({...data.user,name,avatar:name.split(" ").map(w=>w[0]).join("").toUpperCase().slice(0,2)});
-  };
-  return (
+  const [mode,setMode]=useState("login"),[email,setEmail]=useState(""),[password,setPassword]=useState(""),[name,setName]=useState(""),[error,setError]=useState(""),[loading,setLoading]=useState(false),[showPass,setShowPass]=useState(false);
+  const handleLogin=async()=>{setError("");if(!email||!password){setError("Completa todos los campos.");return;}setLoading(true);const{data,error:e}=await supabase.auth.signInWithPassword({email,password});if(e){setError("Correo o contraseña incorrectos.");setLoading(false);return;}const{data:prof}=await supabase.from("profiles").select("*").eq("id",data.user.id).single();onLogin({...data.user,name:prof?.name||email,avatar:prof?.avatar||email.slice(0,2).toUpperCase()});};
+  const handleRegister=async()=>{setError("");if(!name||!email||!password){setError("Completa todos los campos.");return;}if(password.length<8){setError("La contraseña debe tener al menos 8 caracteres.");return;}setLoading(true);const{data,error:e}=await supabase.auth.signUp({email,password,options:{data:{name,avatar:name.split(" ").map(w=>w[0]).join("").toUpperCase().slice(0,2)}}});if(e){setError(e.message);setLoading(false);return;}onLogin({...data.user,name,avatar:name.split(" ").map(w=>w[0]).join("").toUpperCase().slice(0,2)});};
+  return(
     <div style={{minHeight:"100vh",background:"#080c14",display:"flex",fontFamily:"'Plus Jakarta Sans',system-ui,sans-serif"}}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&family=Instrument+Serif:ital@0;1&display=swap');*{box-sizing:border-box;margin:0;padding:0}@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}.login-input:focus{border-color:#0ea5e9!important;outline:none}`}</style>
       <div style={{flex:1,background:"linear-gradient(135deg,#0c1018,#0d1526)",display:"flex",flexDirection:"column",justifyContent:"space-between",padding:"40px 48px",position:"relative",overflow:"hidden"}}>
@@ -562,14 +586,9 @@ function LoginPage({ onLogin, onBack }) {
         <div style={{animation:"fadeUp 0.7s ease forwards"}}>
           <div style={{fontSize:11,fontWeight:700,color:"#0ea5e9",textTransform:"uppercase",letterSpacing:"0.12em",marginBottom:16}}>Performance Tracker</div>
           <h2 style={{fontSize:"clamp(28px,3vw,42px)",fontWeight:900,letterSpacing:"-0.04em",lineHeight:1.1,color:"#e6eaf4",marginBottom:20}}>Tu portafolio.<br/><span style={{fontFamily:"'Instrument Serif',serif",fontStyle:"italic",color:"#0ea5e9"}}>Todo claro.</span></h2>
-          <p style={{fontSize:14,color:"#7d8fa8",lineHeight:1.65,maxWidth:380}}>Importa tu historial MT5 y ve tu P&L real día a día.</p>
+          <p style={{fontSize:14,color:"#7d8fa8",lineHeight:1.65,maxWidth:380}}>Conecta tus cuentas MT5 en vivo o importa tu historial CSV.</p>
           <div style={{marginTop:36,display:"flex",flexDirection:"column",gap:12}}>
-            {["Importa reporte HTML desde MT5 en 1 clic","Calendario de P&L diario con heatmap","Dashboard consolidado de todas tus cuentas","ROI y beneficio neto en tiempo real"].map(f=>(
-              <div key={f} style={{display:"flex",alignItems:"center",gap:10}}>
-                <div style={{width:18,height:18,borderRadius:"50%",background:"rgba(34,208,122,0.15)",border:"1px solid #22d07a40",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}><span style={{fontSize:10,color:"#22d07a"}}>✓</span></div>
-                <span style={{fontSize:13,color:"#7d8fa8"}}>{f}</span>
-              </div>
-            ))}
+            {["Conexión directa MT5 — balance en tiempo real","Importa historial HTML desde MT5 en 1 clic","Calendario de P&L diario con heatmap","ROI y beneficio neto en tiempo real"].map(f=>(<div key={f} style={{display:"flex",alignItems:"center",gap:10}}><div style={{width:18,height:18,borderRadius:"50%",background:"rgba(34,208,122,0.15)",border:"1px solid #22d07a40",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}><span style={{fontSize:10,color:"#22d07a"}}>✓</span></div><span style={{fontSize:13,color:"#7d8fa8"}}>{f}</span></div>))}
           </div>
         </div>
         <div style={{background:"#141923",border:"1px solid #232e42",borderRadius:14,padding:"18px 20px"}}>
@@ -583,9 +602,7 @@ function LoginPage({ onLogin, onBack }) {
       <div style={{width:"min(480px,100%)",background:"#0c1018",display:"flex",flexDirection:"column",justifyContent:"center",padding:"48px 40px",borderLeft:"1px solid #141923"}}>
         <div style={{animation:"fadeUp 0.6s ease forwards"}}>
           <div style={{display:"flex",background:"#141923",borderRadius:12,padding:4,marginBottom:32,border:"1px solid #232e42"}}>
-            {[{id:"login",label:"Iniciar sesión"},{id:"register",label:"Crear cuenta"}].map(tab=>(
-              <button key={tab.id} onClick={()=>{setMode(tab.id);setError("");}} style={{flex:1,padding:"9px 0",borderRadius:9,border:"none",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"inherit",background:mode===tab.id?"#1a2233":"transparent",color:mode===tab.id?"#e6eaf4":"#3d4f66",transition:"all 0.2s"}}>{tab.label}</button>
-            ))}
+            {[{id:"login",label:"Iniciar sesión"},{id:"register",label:"Crear cuenta"}].map(tab=>(<button key={tab.id} onClick={()=>{setMode(tab.id);setError("");}} style={{flex:1,padding:"9px 0",borderRadius:9,border:"none",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"inherit",background:mode===tab.id?"#1a2233":"transparent",color:mode===tab.id?"#e6eaf4":"#3d4f66",transition:"all 0.2s"}}>{tab.label}</button>))}
           </div>
           <h3 style={{fontSize:22,fontWeight:800,color:"#e6eaf4",marginBottom:6,letterSpacing:"-0.02em"}}>{mode==="login"?"Bienvenido de vuelta":"Crea tu cuenta"}</h3>
           <p style={{fontSize:13,color:"#3d4f66",marginBottom:28}}>{mode==="login"?"Ingresa tus datos para acceder":"Completa el formulario para comenzar"}</p>
@@ -593,15 +610,10 @@ function LoginPage({ onLogin, onBack }) {
             {mode==="register"&&(<div><label style={{fontSize:11,color:"#7d8fa8",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",display:"block",marginBottom:6}}>Nombre completo</label><input className="login-input" value={name} onChange={e=>setName(e.target.value)} placeholder="Gabriel Maya" style={{width:"100%",background:"#141923",border:"1px solid #232e42",borderRadius:10,padding:"12px 16px",color:"#e6eaf4",fontSize:14,fontFamily:"inherit"}}/></div>)}
             <div><label style={{fontSize:11,color:"#7d8fa8",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",display:"block",marginBottom:6}}>Correo electrónico</label><input className="login-input" value={email} onChange={e=>setEmail(e.target.value)} type="email" placeholder="tu@correo.com" style={{width:"100%",background:"#141923",border:"1px solid #232e42",borderRadius:10,padding:"12px 16px",color:"#e6eaf4",fontSize:14,fontFamily:"inherit"}}/></div>
             <div><label style={{fontSize:11,color:"#7d8fa8",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",display:"block",marginBottom:6}}>Contraseña</label>
-              <div style={{position:"relative"}}>
-                <input className="login-input" value={password} onChange={e=>setPassword(e.target.value)} type={showPass?"text":"password"} placeholder="••••••••" onKeyDown={e=>e.key==="Enter"&&(mode==="login"?handleLogin():handleRegister())} style={{width:"100%",background:"#141923",border:"1px solid #232e42",borderRadius:10,padding:"12px 44px 12px 16px",color:"#e6eaf4",fontSize:14,fontFamily:"inherit"}}/>
-                <button onClick={()=>setShowPass(s=>!s)} style={{position:"absolute",right:12,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",color:"#3d4f66",cursor:"pointer",fontSize:16}}>{showPass?"🙈":"👁"}</button>
-              </div>
+              <div style={{position:"relative"}}><input className="login-input" value={password} onChange={e=>setPassword(e.target.value)} type={showPass?"text":"password"} placeholder="••••••••" onKeyDown={e=>e.key==="Enter"&&(mode==="login"?handleLogin():handleRegister())} style={{width:"100%",background:"#141923",border:"1px solid #232e42",borderRadius:10,padding:"12px 44px 12px 16px",color:"#e6eaf4",fontSize:14,fontFamily:"inherit"}}/><button onClick={()=>setShowPass(s=>!s)} style={{position:"absolute",right:12,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",color:"#3d4f66",cursor:"pointer",fontSize:16}}>{showPass?"🙈":"👁"}</button></div>
             </div>
             {error&&<div style={{background:"rgba(240,71,106,0.1)",border:"1px solid rgba(240,71,106,0.3)",borderRadius:9,padding:"10px 14px",fontSize:12,color:"#f0476a"}}>{error}</div>}
-            <button onClick={mode==="login"?handleLogin:handleRegister} disabled={loading} style={{padding:"13px 0",borderRadius:10,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontSize:14,fontWeight:700,cursor:loading?"wait":"pointer",fontFamily:"inherit",marginTop:4,opacity:loading?0.7:1}}>
-              {loading?"Cargando...":(mode==="login"?"Entrar →":"Crear cuenta →")}
-            </button>
+            <button onClick={mode==="login"?handleLogin:handleRegister} disabled={loading} style={{padding:"13px 0",borderRadius:10,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontSize:14,fontWeight:700,cursor:loading?"wait":"pointer",fontFamily:"inherit",marginTop:4,opacity:loading?0.7:1}}>{loading?"Cargando...":(mode==="login"?"Entrar →":"Crear cuenta →")}</button>
           </div>
         </div>
       </div>
@@ -615,35 +627,38 @@ function Dashboard({ user, onLogout }) {
   const [accounts,setAccounts]=useState([]);
   const [view,setView]=useState("dashboard");
   const [expandedId,setExpandedId]=useState(null);
+  const [connectModal,setConnectModal]=useState(false);
   const [importModal,setImportModal]=useState(false);
+  const [syncing,setSyncing]=useState(null);
   const [loadingData,setLoadingData]=useState(true);
 
-  const fetchData = async () => {
-    setLoadingData(true);
-    const {data}=await supabase.from("mt_accounts").select("*").eq("user_id",user.id).order("created_at");
-    setAccounts(data||[]);
-    setLoadingData(false);
-  };
-  useEffect(()=>{ fetchData(); },[user.id]);
+  const fetchData=async()=>{setLoadingData(true);const{data}=await supabase.from("mt_accounts").select("*").eq("user_id",user.id).order("created_at");setAccounts(data||[]);setLoadingData(false);};
+  useEffect(()=>{fetchData();},[user.id]);
 
-  const deleteAccount = async (id) => {
-    if(!window.confirm("¿Eliminar esta cuenta y todo su historial?")) return;
-    await supabase.from("daily_pnl").delete().eq("account_id",id);
-    await supabase.from("balance_history").delete().eq("account_id",id);
-    await supabase.from("mt_accounts").delete().eq("id",id);
-    setAccounts(p=>p.filter(a=>a.id!==id));
+  const syncAccount=async(acc)=>{
+    setSyncing(acc.id);
+    try{
+      const token=await mtConnect(acc.login,acc.password||acc.investor_password,acc.server);
+      const summary=await mtGetBalance(token);
+      await mtWaitForHistory(token,45000);
+      const from=new Date(); from.setMonth(from.getMonth()-1);
+      const orders=await mtGetOrders(token,from,new Date());
+      const dailyPnL=groupOrdersByDay(orders);
+      await supabase.from("mt_accounts").update({current_balance:summary.balance,last_sync:new Date().toISOString(),metaapi_account_id:token}).eq("id",acc.id);
+      const pnlRows=Object.entries(dailyPnL).map(([date,d])=>({user_id:user.id,account_id:acc.id,date,pnl:Math.round(d.pnl*100)/100,trades_count:d.trades}));
+      if(pnlRows.length>0)await supabase.from("daily_pnl").upsert(pnlRows,{onConflict:"account_id,date"});
+      await fetchData();
+    }catch(e){alert("Error sincronizando: "+e.message);}
+    setSyncing(null);
   };
 
-  const SS=useMemo(()=>{
-    const ti=accounts.reduce((s,a)=>s+a.cost,0), tw=accounts.reduce((s,a)=>s+a.withdrawn,0);
-    const tc=accounts.reduce((s,a)=>s+a.current_balance,0), tini=accounts.reduce((s,a)=>s+a.initial_balance,0);
-    const pnl=tc-tini, nb=tw-ti, roi=ti>0?(nb/ti)*100:0;
-    return{live:accounts.filter(a=>a.status==="Live").length,ti,tw,tc,pnl,nb,roi};
-  },[accounts]);
+  const deleteAccount=async(id)=>{if(!window.confirm("¿Eliminar esta cuenta?"))return;await supabase.from("daily_pnl").delete().eq("account_id",id);await supabase.from("balance_history").delete().eq("account_id",id);await supabase.from("mt_accounts").delete().eq("id",id);setAccounts(p=>p.filter(a=>a.id!==id));};
+
+  const SS=useMemo(()=>{const ti=accounts.reduce((s,a)=>s+a.cost,0),tw=accounts.reduce((s,a)=>s+a.withdrawn,0),tc=accounts.reduce((s,a)=>s+a.current_balance,0),tini=accounts.reduce((s,a)=>s+a.initial_balance,0),pnl=tc-tini,nb=tw-ti,roi=ti>0?(nb/ti)*100:0;return{live:accounts.filter(a=>a.status==="Live"&&a.login!=="imported").length,ti,tw,tc,pnl,nb,roi};},[accounts]);
 
   const navs=[{id:"dashboard",icon:"▦",label:"Dashboard"},{id:"accounts",icon:"◈",label:"Cuentas"},{id:"calendar",icon:"⊞",label:"Calendario"},{id:"monthly",icon:"≡",label:"Mensual"}];
 
-  return (
+  return(
     <div style={{minHeight:"100vh",background:t.bg,color:t.text,fontFamily:"'Plus Jakarta Sans',system-ui,sans-serif",display:"flex"}}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}::-webkit-scrollbar{width:5px}::-webkit-scrollbar-thumb{background:#232e42;border-radius:3px}button{font-family:inherit}select option{background:#141923}@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}`}</style>
       <div style={{width:212,background:t.sidebar,borderRight:`1px solid ${t.border}`,display:"flex",flexDirection:"column",padding:"22px 0",position:"fixed",top:0,left:0,bottom:0,zIndex:100}}>
@@ -657,77 +672,74 @@ function Dashboard({ user, onLogout }) {
         {navs.map(n=>(<button key={n.id} onClick={()=>setView(n.id)} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 20px",border:"none",cursor:"pointer",background:view===n.id?"rgba(14,165,233,0.09)":"transparent",color:view===n.id?"#0ea5e9":"#5a6d85",fontSize:13,fontWeight:view===n.id?700:500,borderLeft:view===n.id?"2px solid #0ea5e9":"2px solid transparent",transition:"all 0.13s",textAlign:"left",width:"100%"}}><span style={{fontSize:13}}>{n.icon}</span>{n.label}</button>))}
         <div style={{flex:1}}/>
         <div style={{padding:"0 12px",marginBottom:9}}><button onClick={()=>setDark(d=>!d)} style={{width:"100%",padding:"8px 0",borderRadius:9,border:`1px solid ${t.border}`,background:"transparent",color:"#5a6d85",fontSize:11,fontWeight:600,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>{dark?"☀️ Modo Claro":"🌙 Modo Oscuro"}</button></div>
-        <div style={{padding:"0 12px",marginBottom:9}}><button onClick={()=>setImportModal(true)} style={{width:"100%",padding:"10px 0",borderRadius:9,background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}}>📥 Importar MT5</button></div>
+        <div style={{padding:"0 12px",marginBottom:6}}><button onClick={()=>setConnectModal(true)} style={{width:"100%",padding:"10px 0",borderRadius:9,background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",border:"none",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>🔗 Conectar MT5</button></div>
+        <div style={{padding:"0 12px",marginBottom:9}}><button onClick={()=>setImportModal(true)} style={{width:"100%",padding:"9px 0",borderRadius:9,background:"transparent",border:`1px solid ${t.border}`,color:"#5a6d85",fontSize:12,fontWeight:600,cursor:"pointer"}}>📥 Importar CSV</button></div>
         <div style={{padding:"0 12px"}}><button onClick={onLogout} style={{width:"100%",padding:"8px 0",borderRadius:9,border:`1px solid ${t.border}`,background:"transparent",color:"#5a6d85",fontSize:11,fontWeight:600,cursor:"pointer"}}>← Cerrar sesión</button></div>
       </div>
 
       <div style={{marginLeft:212,flex:1,padding:"32px 36px",maxWidth:"calc(100vw - 212px)"}}>
-        {loadingData?(
-          <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"60vh",flexDirection:"column",gap:16}}>
-            <div style={{fontSize:32,animation:"spin 1s linear infinite"}}>⟳</div>
-            <div style={{color:t.textMuted,fontSize:14}}>Cargando...</div>
-          </div>
-        ):(
-          <>
-          {view==="dashboard"&&(<>
-            <div style={{marginBottom:24}}><h1 style={{fontSize:26,fontWeight:700,letterSpacing:"-0.03em",color:t.text}}>Dashboard</h1><p style={{color:t.textMuted,fontSize:12,marginTop:3}}>Bienvenido, {user.name?.split(" ")[0]} · {accounts.length} cuentas</p></div>
-            {accounts.length===0?(
-              <div style={{textAlign:"center",padding:"80px 20px",background:t.surface,border:`2px dashed ${t.border}`,borderRadius:16}}>
-                <div style={{fontSize:48,marginBottom:16}}>📥</div>
-                <h3 style={{fontSize:18,fontWeight:700,color:t.text,marginBottom:8}}>Importa tu primer reporte MT5</h3>
-                <p style={{fontSize:13,color:t.textMuted,marginBottom:24,maxWidth:400,margin:"0 auto 24px"}}>Exporta el historial detallado desde MetaTrader 5 y súbelo aquí.</p>
-                <button onClick={()=>setImportModal(true)} style={{padding:"12px 28px",borderRadius:10,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontSize:14,fontWeight:700,cursor:"pointer"}}>📥 Importar ahora</button>
-              </div>
-            ):(
-              <>
-                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(175px,1fr))",gap:11,marginBottom:20}}>
-                  <StatBox t={t} icon="🟢" label="Cuentas" value={accounts.length} sub={`${SS.live} activas`} color={t.positive}/>
-                  <StatBox t={t} icon="💸" label="Invertido" value={fmtUSD(SS.ti)} color={t.negative}/>
-                  <StatBox t={t} icon="💰" label="Retirado" value={fmtUSD(SS.tw)} color={t.positive}/>
-                  <StatBox t={t} icon="📈" label="P&L Total" value={fmtUSD(SS.pnl)} color={SS.pnl>=0?t.positive:t.negative}/>
-                  <StatBox t={t} icon="⚡" label="Beneficio Neto" value={fmtUSD(SS.nb)} color={SS.nb>=0?t.positive:t.negative}/>
-                  <StatBox t={t} icon="🚀" label="ROI" value={fmtPct(SS.roi)} color={SS.roi>=0?t.positive:t.negative}/>
-                </div>
-                <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:14,padding:20}}>
-                  <div style={{fontSize:10,fontWeight:700,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:14}}>Capital por cuenta</div>
-                  <div style={{display:"flex",flexDirection:"column",gap:9}}>
-                    {accounts.slice().sort((a,b)=>b.current_balance-a.current_balance).map(a=>{
-                      const pp=a.initial_balance>0?((a.current_balance-a.initial_balance)/a.initial_balance)*100:0, pct2=SS.tc>0?(a.current_balance/SS.tc)*100:0;
-                      return(<div key={a.id} style={{display:"flex",alignItems:"center",gap:10}}>
-                        <div style={{width:7,height:7,borderRadius:"50%",background:a.color,flexShrink:0}}/>
-                        <div style={{width:140,fontSize:11,color:t.textSub,flexShrink:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{a.name}</div>
-                        <div style={{flex:1,height:6,background:t.surfaceAlt,borderRadius:4,overflow:"hidden"}}><div style={{width:`${pct2}%`,height:"100%",background:a.color,borderRadius:4,opacity:0.75}}/></div>
-                        <div style={{width:90,textAlign:"right",fontSize:12,color:t.text,fontWeight:600}}>{fmtUSD(a.current_balance)}</div>
-                        <div style={{width:58,textAlign:"right",fontSize:11,fontWeight:700,color:pp>=0?t.positive:t.negative}}>{fmtPct(pp)}</div>
-                      </div>);
-                    })}
-                  </div>
-                </div>
-              </>
-            )}
-          </>)}
-          {view==="accounts"&&(<>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:22}}>
-              <div><h1 style={{fontSize:26,fontWeight:700,letterSpacing:"-0.03em",color:t.text}}>Mis Cuentas</h1><p style={{color:t.textMuted,fontSize:12,marginTop:3}}>{accounts.length} cuentas</p></div>
-              <button onClick={()=>setImportModal(true)} style={{padding:"9px 18px",borderRadius:9,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}}>📥 Importar MT5</button>
+        {loadingData?(<div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"60vh",flexDirection:"column",gap:16}}><div style={{fontSize:32,animation:"spin 1s linear infinite"}}>⟳</div><div style={{color:t.textMuted,fontSize:14}}>Cargando...</div></div>):(
+        <>
+        {view==="dashboard"&&(<>
+          <div style={{marginBottom:24}}><h1 style={{fontSize:26,fontWeight:700,letterSpacing:"-0.03em",color:t.text}}>Dashboard</h1><p style={{color:t.textMuted,fontSize:12,marginTop:3}}>Bienvenido, {user.name?.split(" ")[0]} · {accounts.length} cuentas</p></div>
+          {accounts.length===0?(<div style={{textAlign:"center",padding:"80px 20px",background:t.surface,border:`2px dashed ${t.border}`,borderRadius:16}}>
+            <div style={{fontSize:48,marginBottom:16}}>🔗</div>
+            <h3 style={{fontSize:18,fontWeight:700,color:t.text,marginBottom:8}}>Conecta tu primera cuenta</h3>
+            <p style={{fontSize:13,color:t.textMuted,marginBottom:24,maxWidth:400,margin:"0 auto 24px"}}>Conecta MT5 en vivo o importa tu historial CSV.</p>
+            <div style={{display:"flex",gap:12,justifyContent:"center"}}>
+              <button onClick={()=>setConnectModal(true)} style={{padding:"12px 24px",borderRadius:10,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontSize:14,fontWeight:700,cursor:"pointer"}}>🔗 Conectar MT5</button>
+              <button onClick={()=>setImportModal(true)} style={{padding:"12px 24px",borderRadius:10,border:`1px solid ${t.border}`,background:"transparent",color:t.textSub,fontSize:14,fontWeight:600,cursor:"pointer"}}>📥 Importar CSV</button>
             </div>
-            {accounts.length===0?(<div style={{textAlign:"center",padding:"60px 20px",background:t.surface,border:`2px dashed ${t.border}`,borderRadius:16}}><div style={{fontSize:40,marginBottom:12}}>📭</div><p style={{color:t.textMuted,fontSize:13}}>No tienes cuentas importadas aún</p></div>):(accounts.map(a=><AccountRow key={a.id} acc={a} expanded={expandedId===a.id} onToggle={()=>setExpandedId(expandedId===a.id?null:a.id)} onDelete={deleteAccount} t={t}/>))}
+          </div>):(<>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(175px,1fr))",gap:11,marginBottom:20}}>
+              <StatBox t={t} icon="🟢" label="Live MT5" value={SS.live} sub={`${accounts.length} totales`} color={t.positive}/>
+              <StatBox t={t} icon="💸" label="Invertido" value={fmtUSD(SS.ti)} color={t.negative}/>
+              <StatBox t={t} icon="💰" label="Retirado" value={fmtUSD(SS.tw)} color={t.positive}/>
+              <StatBox t={t} icon="📈" label="P&L Total" value={fmtUSD(SS.pnl)} color={SS.pnl>=0?t.positive:t.negative}/>
+              <StatBox t={t} icon="⚡" label="Beneficio Neto" value={fmtUSD(SS.nb)} color={SS.nb>=0?t.positive:t.negative}/>
+              <StatBox t={t} icon="🚀" label="ROI" value={fmtPct(SS.roi)} color={SS.roi>=0?t.positive:t.negative}/>
+            </div>
+            <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:14,padding:20}}>
+              <div style={{fontSize:10,fontWeight:700,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:14}}>Capital por cuenta</div>
+              <div style={{display:"flex",flexDirection:"column",gap:9}}>
+                {accounts.slice().sort((a,b)=>b.current_balance-a.current_balance).map(a=>{const pp=a.initial_balance>0?((a.current_balance-a.initial_balance)/a.initial_balance)*100:0,pct2=SS.tc>0?(a.current_balance/SS.tc)*100:0;return(<div key={a.id} style={{display:"flex",alignItems:"center",gap:10}}>
+                  <div style={{width:7,height:7,borderRadius:"50%",background:a.color,flexShrink:0}}/>
+                  <div style={{width:140,fontSize:11,color:t.textSub,flexShrink:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{a.name}</div>
+                  <div style={{flex:1,height:6,background:t.surfaceAlt,borderRadius:4,overflow:"hidden"}}><div style={{width:`${pct2}%`,height:"100%",background:a.color,borderRadius:4,opacity:0.75}}/></div>
+                  <div style={{width:90,textAlign:"right",fontSize:12,color:t.text,fontWeight:600}}>{fmtUSD(a.current_balance)}</div>
+                  <div style={{width:58,textAlign:"right",fontSize:11,fontWeight:700,color:pp>=0?t.positive:t.negative}}>{fmtPct(pp)}</div>
+                  {a.login!=="imported"&&<button onClick={()=>syncAccount(a)} disabled={syncing===a.id} style={{fontSize:11,color:"#0ea5e9",background:"none",border:"none",cursor:"pointer",padding:"2px 4px"}} title="Sincronizar">{syncing===a.id?"⟳":"🔄"}</button>}
+                </div>);})}
+              </div>
+            </div>
           </>)}
-          {view==="calendar"&&<PerformanceCalendar userId={user.id} accounts={accounts} t={t}/>}
-          {view==="monthly"&&(<>
-            <div style={{marginBottom:22}}><h1 style={{fontSize:26,fontWeight:700,letterSpacing:"-0.03em",color:t.text}}>Resumen Mensual</h1></div>
-            {accounts.map(a=>{
-              const pnl=a.current_balance-a.initial_balance, pct=a.initial_balance>0?(pnl/a.initial_balance)*100:0, nb=a.withdrawn-a.cost;
-              return(<div key={a.id} style={{border:`1px solid ${t.border}`,borderLeft:`3px solid ${a.color}`,borderRadius:10,padding:"14px 18px",marginBottom:8,background:t.surface,display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
-                <div style={{flex:1}}><div style={{fontSize:13,fontWeight:700,color:t.text}}>{a.name}</div><div style={{fontSize:11,color:t.textMuted}}>{a.provider} · {a.type}</div></div>
-                {[{l:"Balance",v:fmtUSD(a.current_balance),c:t.text},{l:"P&L",v:`${fmtUSD(pnl)} (${fmtPct(pct)})`,c:pnl>=0?t.positive:t.negative},{l:"Inversión",v:fmtUSD(a.cost),c:t.negative},{l:"Retirado",v:fmtUSD(a.withdrawn),c:t.positive},{l:"Neto",v:fmtUSD(nb),c:nb>=0?t.positive:t.negative}].map(s=>(<div key={s.l} style={{textAlign:"right"}}><div style={{fontSize:9,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:3}}>{s.l}</div><div style={{fontSize:13,fontWeight:700,color:s.c}}>{s.v}</div></div>))}
-              </div>);
-            })}
-            {accounts.length>0&&(<div style={{background:t.surface,border:`2px solid rgba(14,165,233,0.18)`,borderRadius:14,padding:"20px 24px",marginTop:12}}><div style={{fontSize:10,fontWeight:700,color:"#0ea5e9",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:16}}>Totales</div><div style={{display:"flex",gap:24,flexWrap:"wrap"}}>{[{l:"Invertido",v:fmtUSD(SS.ti),c:t.negative},{l:"Retirado",v:fmtUSD(SS.tw),c:t.positive},{l:"Beneficio neto",v:fmtUSD(SS.nb),c:SS.nb>=0?t.positive:t.negative},{l:"P&L",v:fmtUSD(SS.pnl),c:SS.pnl>=0?t.positive:t.negative},{l:"ROI",v:fmtPct(SS.roi),c:SS.roi>=0?t.positive:t.negative}].map(s=>(<div key={s.l}><div style={{fontSize:9,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.09em",marginBottom:5}}>{s.l}</div><div style={{fontSize:20,fontWeight:700,color:s.c}}>{s.v}</div></div>))}</div></div>)}
-          </>)}
-          </>
-        )}
+        </>)}
+
+        {view==="accounts"&&(<>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:22}}>
+            <div><h1 style={{fontSize:26,fontWeight:700,letterSpacing:"-0.03em",color:t.text}}>Mis Cuentas</h1><p style={{color:t.textMuted,fontSize:12,marginTop:3}}>{accounts.length} cuentas · {SS.live} live</p></div>
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={()=>setConnectModal(true)} style={{padding:"9px 16px",borderRadius:9,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>🔗 MT5 Live</button>
+              <button onClick={()=>setImportModal(true)} style={{padding:"9px 16px",borderRadius:9,border:`1px solid ${t.border}`,background:"transparent",color:t.textSub,fontSize:12,fontWeight:600,cursor:"pointer"}}>📥 CSV</button>
+            </div>
+          </div>
+          {accounts.length===0?(<div style={{textAlign:"center",padding:"60px 20px",background:t.surface,border:`2px dashed ${t.border}`,borderRadius:16}}><div style={{fontSize:40,marginBottom:12}}>📭</div><p style={{color:t.textMuted,fontSize:13}}>No tienes cuentas aún</p></div>):(accounts.map(a=><AccountRow key={a.id} acc={a} expanded={expandedId===a.id} onToggle={()=>setExpandedId(expandedId===a.id?null:a.id)} onSync={syncAccount} onDelete={deleteAccount} syncing={syncing} t={t}/>))}
+        </>)}
+
+        {view==="calendar"&&<PerformanceCalendar userId={user.id} accounts={accounts} t={t}/>}
+
+        {view==="monthly"&&(<>
+          <div style={{marginBottom:22}}><h1 style={{fontSize:26,fontWeight:700,letterSpacing:"-0.03em",color:t.text}}>Resumen Mensual</h1></div>
+          {accounts.map(a=>{const pnl=a.current_balance-a.initial_balance,pct=a.initial_balance>0?(pnl/a.initial_balance)*100:0,nb=a.withdrawn-a.cost;return(<div key={a.id} style={{border:`1px solid ${t.border}`,borderLeft:`3px solid ${a.color}`,borderRadius:10,padding:"14px 18px",marginBottom:8,background:t.surface,display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
+            <div style={{flex:1}}><div style={{fontSize:13,fontWeight:700,color:t.text}}>{a.name}</div><div style={{fontSize:11,color:t.textMuted}}>{a.provider} · {a.type} · {a.login!=="imported"?"🔗 Live":"📥 CSV"}</div></div>
+            {[{l:"Balance",v:fmtUSD(a.current_balance),c:t.text},{l:"P&L",v:`${fmtUSD(pnl)} (${fmtPct(pct)})`,c:pnl>=0?t.positive:t.negative},{l:"Inversión",v:fmtUSD(a.cost),c:t.negative},{l:"Retirado",v:fmtUSD(a.withdrawn),c:t.positive},{l:"Neto",v:fmtUSD(nb),c:nb>=0?t.positive:t.negative}].map(s=>(<div key={s.l} style={{textAlign:"right"}}><div style={{fontSize:9,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:3}}>{s.l}</div><div style={{fontSize:13,fontWeight:700,color:s.c}}>{s.v}</div></div>))}
+          </div>);})}
+          {accounts.length>0&&(<div style={{background:t.surface,border:`2px solid rgba(14,165,233,0.18)`,borderRadius:14,padding:"20px 24px",marginTop:12}}><div style={{fontSize:10,fontWeight:700,color:"#0ea5e9",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:16}}>Totales</div><div style={{display:"flex",gap:24,flexWrap:"wrap"}}>{[{l:"Invertido",v:fmtUSD(SS.ti),c:t.negative},{l:"Retirado",v:fmtUSD(SS.tw),c:t.positive},{l:"Beneficio neto",v:fmtUSD(SS.nb),c:SS.nb>=0?t.positive:t.negative},{l:"P&L",v:fmtUSD(SS.pnl),c:SS.pnl>=0?t.positive:t.negative},{l:"ROI",v:fmtPct(SS.roi),c:SS.roi>=0?t.positive:t.negative}].map(s=>(<div key={s.l}><div style={{fontSize:9,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.09em",marginBottom:5}}>{s.l}</div><div style={{fontSize:20,fontWeight:700,color:s.c}}>{s.v}</div></div>))}</div></div>)}
+        </>)}
+        </>)}
       </div>
+
+      <ConnectMT5Modal open={connectModal} onClose={()=>setConnectModal(false)} onConnected={fetchData} userId={user.id} t={t}/>
       <ImportModal open={importModal} onClose={()=>setImportModal(false)} onImported={fetchData} userId={user.id} t={t}/>
     </div>
   );
@@ -736,18 +748,9 @@ function Dashboard({ user, onLogout }) {
 export default function MayahouseFX() {
   const [screen,setScreen]=useState("landing");
   const [user,setUser]=useState(null);
-  useEffect(()=>{
-    supabase.auth.getSession().then(({data:{session}})=>{
-      if(session?.user){
-        supabase.from("profiles").select("*").eq("id",session.user.id).single().then(({data:prof})=>{
-          setUser({...session.user,name:prof?.name||session.user.email,avatar:prof?.avatar||session.user.email?.slice(0,2).toUpperCase()});
-          setScreen("dashboard");
-        });
-      }
-    });
-  },[]);
-  const handleLogin=(u)=>{ setUser(u); setScreen("dashboard"); };
-  const handleLogout=async()=>{ await supabase.auth.signOut(); setUser(null); setScreen("landing"); };
+  useEffect(()=>{supabase.auth.getSession().then(({data:{session}})=>{if(session?.user){supabase.from("profiles").select("*").eq("id",session.user.id).single().then(({data:prof})=>{setUser({...session.user,name:prof?.name||session.user.email,avatar:prof?.avatar||session.user.email?.slice(0,2).toUpperCase()});setScreen("dashboard");});}});}, []);
+  const handleLogin=(u)=>{setUser(u);setScreen("dashboard");};
+  const handleLogout=async()=>{await supabase.auth.signOut();setUser(null);setScreen("landing");};
   if(screen==="landing") return <LandingPage onGoToLogin={()=>setScreen("login")}/>;
   if(screen==="login")   return <LoginPage onLogin={handleLogin} onBack={()=>setScreen("landing")}/>;
   if(screen==="dashboard") return <Dashboard user={user} onLogout={handleLogout}/>;
