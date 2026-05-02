@@ -14,8 +14,8 @@ const getDaysInMonth     = (y,m) => new Date(y,m+1,0).getDate();
 const getFirstDayOfMonth = (y,m) => { const d=new Date(y,m,1).getDay(); return d===0?6:d-1; };
 const PALETTE = ["#0ea5e9","#8b5cf6","#f59e0b","#ec4899","#f43f5e","#10b981","#06b6d4","#f97316","#a78bfa","#34d399"];
 const T = {
-  dark:  { bg:"#0c1018",surface:"#141923",surfaceAlt:"#1a2233",surfaceHover:"#1e2840",border:"#232e42",text:"#e6eaf4",textSub:"#7d8fa8",textMuted:"#3d4f66",positive:"#22d07a",negative:"#f0476a",posLight:"rgba(34,208,122,0.08)",negLight:"rgba(240,71,106,0.08)",sidebar:"#0a0d14" },
-  light: { bg:"#eef1f8",surface:"#ffffff", surfaceAlt:"#f2f5fc",surfaceHover:"#e8edf8",border:"#d4dae8",text:"#0d1526",textSub:"#4a5568",textMuted:"#94a3b8",positive:"#16a34a",negative:"#dc2626",posLight:"rgba(22,163,74,0.08)",negLight:"rgba(220,38,38,0.08)",sidebar:"#161d2e" },
+  dark:  { bg:"#0c1018",surface:"#141923",surfaceAlt:"#1a2233",surfaceHover:"#1e2840",border:"#232e42",text:"#f0f4ff",textSub:"#a8b8d0",textMuted:"#5a6f8a",sidebarText:"#c8d8f0",sidebarMuted:"#6a7e9a",positive:"#22d07a",negative:"#f0476a",posLight:"rgba(34,208,122,0.08)",negLight:"rgba(240,71,106,0.08)",sidebar:"#0a0d14" },
+  light: { bg:"#eef1f8",surface:"#ffffff", surfaceAlt:"#f2f5fc",surfaceHover:"#e8edf8",border:"#d4dae8",text:"#0d1526",textSub:"#374151",textMuted:"#6b7280",sidebarText:"#e2eaf8",sidebarMuted:"#8899b8",positive:"#16a34a",negative:"#dc2626",posLight:"rgba(22,163,74,0.08)",negLight:"rgba(220,38,38,0.08)",sidebar:"#161d2e" },
 };
 
 // ─── mtapi.io helpers ─────────────────────────────────────────────────────────
@@ -430,7 +430,7 @@ function AccountRow({ acc, expanded, onToggle, onSync, onDelete, syncing, t }) {
         <div style={{width:8,height:8,borderRadius:"50%",background:acc.color,flexShrink:0,boxShadow:`0 0 6px ${acc.color}80`}}/>
         <div style={{flex:1,minWidth:0}}>
           <span style={{fontSize:13,fontWeight:600,color:t.text}}>{acc.name}</span>
-          <span style={{fontSize:11,color:t.textMuted,marginLeft:10}}>{acc.provider} · {acc.type}</span>
+          <span style={{fontSize:11,color:t.textSub,marginLeft:10,fontWeight:500}}>{acc.provider} · {acc.type}</span>
         </div>
         <StatusBadge status={acc.status}/>
         {isLive&&<span style={{fontSize:10,color:"#22d07a",background:"rgba(34,208,122,0.1)",padding:"2px 8px",borderRadius:20,border:"1px solid rgba(34,208,122,0.2)"}}>🔗 Live</span>}
@@ -669,12 +669,12 @@ function Dashboard({ user, onLogout }) {
             <div style={{flex:1,minWidth:0}}><div style={{fontSize:12,fontWeight:700,color:t.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{user.name}</div><div style={{fontSize:10,color:t.textMuted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{user.email}</div></div>
           </div>
         </div>
-        {navs.map(n=>(<button key={n.id} onClick={()=>setView(n.id)} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 20px",border:"none",cursor:"pointer",background:view===n.id?"rgba(14,165,233,0.09)":"transparent",color:view===n.id?"#0ea5e9":"#5a6d85",fontSize:13,fontWeight:view===n.id?700:500,borderLeft:view===n.id?"2px solid #0ea5e9":"2px solid transparent",transition:"all 0.13s",textAlign:"left",width:"100%"}}><span style={{fontSize:13}}>{n.icon}</span>{n.label}</button>))}
+        {navs.map(n=>(<button key={n.id} onClick={()=>setView(n.id)} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 20px",border:"none",cursor:"pointer",background:view===n.id?"rgba(14,165,233,0.09)":"transparent",color:view===n.id?"#0ea5e9":t.sidebarText,fontSize:13,fontWeight:view===n.id?700:500,borderLeft:view===n.id?"2px solid #0ea5e9":"2px solid transparent",transition:"all 0.13s",textAlign:"left",width:"100%"}}><span style={{fontSize:13}}>{n.icon}</span>{n.label}</button>))}
         <div style={{flex:1}}/>
-        <div style={{padding:"0 12px",marginBottom:9}}><button onClick={()=>setDark(d=>!d)} style={{width:"100%",padding:"8px 0",borderRadius:9,border:`1px solid ${t.border}`,background:"transparent",color:"#5a6d85",fontSize:11,fontWeight:600,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>{dark?"☀️ Modo Claro":"🌙 Modo Oscuro"}</button></div>
+        <div style={{padding:"0 12px",marginBottom:9}}><button onClick={()=>setDark(d=>!d)} style={{width:"100%",padding:"8px 0",borderRadius:9,border:`1px solid ${t.border}`,background:"transparent",color:t.sidebarMuted,fontSize:11,fontWeight:600,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>{dark?"☀️ Modo Claro":"🌙 Modo Oscuro"}</button></div>
         <div style={{padding:"0 12px",marginBottom:6}}><button onClick={()=>setConnectModal(true)} style={{width:"100%",padding:"10px 0",borderRadius:9,background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",border:"none",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>🔗 Conectar MT5</button></div>
-        <div style={{padding:"0 12px",marginBottom:9}}><button onClick={()=>setImportModal(true)} style={{width:"100%",padding:"9px 0",borderRadius:9,background:"transparent",border:`1px solid ${t.border}`,color:"#5a6d85",fontSize:12,fontWeight:600,cursor:"pointer"}}>📥 Importar CSV</button></div>
-        <div style={{padding:"0 12px"}}><button onClick={onLogout} style={{width:"100%",padding:"8px 0",borderRadius:9,border:`1px solid ${t.border}`,background:"transparent",color:"#5a6d85",fontSize:11,fontWeight:600,cursor:"pointer"}}>← Cerrar sesión</button></div>
+        <div style={{padding:"0 12px",marginBottom:9}}><button onClick={()=>setImportModal(true)} style={{width:"100%",padding:"9px 0",borderRadius:9,background:"transparent",border:`1px solid ${t.border}`,color:t.sidebarMuted,fontSize:12,fontWeight:600,cursor:"pointer"}}>📥 Importar CSV</button></div>
+        <div style={{padding:"0 12px"}}><button onClick={onLogout} style={{width:"100%",padding:"8px 0",borderRadius:9,border:`1px solid ${t.border}`,background:"transparent",color:t.sidebarMuted,fontSize:11,fontWeight:600,cursor:"pointer"}}>← Cerrar sesión</button></div>
       </div>
 
       <div style={{marginLeft:212,flex:1,padding:"32px 36px",maxWidth:"calc(100vw - 212px)"}}>
