@@ -10,189 +10,201 @@ const fmtUSD = (n) => (n<0?"-$":"$")+fmt(Math.abs(n));
 const fmtPct = (n) => (n>=0?"+":"")+fmt(n)+"%";
 const getDaysInMonth     = (y,m) => new Date(y,m+1,0).getDate();
 const getFirstDayOfMonth = (y,m) => { const d=new Date(y,m,1).getDay(); return d===0?6:d-1; };
-
 const PALETTE = ["#0ea5e9","#8b5cf6","#f59e0b","#ec4899","#f43f5e","#10b981","#06b6d4","#f97316","#a78bfa","#34d399"];
 const T = {
   dark:  { bg:"#0c1018",surface:"#141923",surfaceAlt:"#1a2233",surfaceHover:"#1e2840",border:"#232e42",text:"#e6eaf4",textSub:"#7d8fa8",textMuted:"#3d4f66",positive:"#22d07a",negative:"#f0476a",posLight:"rgba(34,208,122,0.08)",negLight:"rgba(240,71,106,0.08)",sidebar:"#0a0d14" },
   light: { bg:"#eef1f8",surface:"#ffffff", surfaceAlt:"#f2f5fc",surfaceHover:"#e8edf8",border:"#d4dae8",text:"#0d1526",textSub:"#4a5568",textMuted:"#94a3b8",positive:"#16a34a",negative:"#dc2626",posLight:"rgba(22,163,74,0.08)",negLight:"rgba(220,38,38,0.08)",sidebar:"#161d2e" },
 };
 
-// ─── Parse MT5 HTML Report ────────────────────────────────────────────────────
-function parseMT5Report(htmlContent) {
-  // Decode UTF-16 LE if needed (MT5 exports in UTF-16)
+// ═══════════════════════════════════════════════════════════
+// MT5 HTML PARSER — Fixed for AXI/MT5 format
+// Column layout: 0=openTime 1=ticket 2=symbol 3=type 4=EMPTY
+//   5=volume 6=openPrice 7=SL 8=TP 9=closeTime 10=closePrice
+//   11=commission 12=swap 13=profit
+// ═══════════════════════════════════════════════════════════
+function parseMT5Report(htmlText) {
   const parser = new DOMParser();
-  const doc = parser.parseFromString(htmlContent, "text/html");
+  const doc = parser.parseFromString(htmlText, "text/html");
   const rows = doc.querySelectorAll("tr");
 
   const trades = [];
   let inPositions = false;
-  let headerPassed = false;
 
   for (const row of rows) {
+    const rowText = row.textContent;
+
+    // Start collecting after "Positions" header
+    if (!inPositions) {
+      if (rowText.includes("Positions")) inPositions = true;
+      continue;
+    }
+    // Stop at "Orders" section
+    if (rowText.includes("Orders") || rowText.includes("Deals")) break;
+
     const cells = row.querySelectorAll("td");
-    const text = row.textContent.trim();
+    if (cells.length < 14) continue;
 
-    if (text.includes("Positions")) { inPositions = true; continue; }
-    if (text.includes("Orders")) { inPositions = false; continue; }
-    if (!inPositions) continue;
-    if (cells.length < 10) continue;
-
-    // Skip header row
-    const firstCell = cells[0]?.textContent?.trim();
-    if (firstCell === "Time" || firstCell === "") continue;
-
-    // Check if it's a trade row (has date format)
-    if (!firstCell?.match(/\d{4}\.\d{2}\.\d{2}/)) continue;
-
-    // Check for hidden colspan (open position rows have hidden cells)
-    const hiddenCells = row.querySelectorAll("td.hidden");
-    if (hiddenCells.length > 0) continue; // skip open positions
+    const openTime = cells[0]?.textContent?.trim();
+    // Must match date pattern like "2026.03.27 08:07:15"
+    if (!openTime || !/^\d{4}\.\d{2}\.\d{2}/.test(openTime)) continue;
 
     try {
-      const openTime  = cells[0]?.textContent?.trim();
-      const symbol    = cells[2]?.textContent?.trim();
-      const type      = cells[3]?.textContent?.trim();
-      const volume    = parseFloat(cells[4]?.textContent?.trim()) || 0;
-      const openPrice = parseFloat(cells[5]?.textContent?.trim()) || 0;
-      const closeTime = cells[8]?.textContent?.trim();
-      const closePrice= parseFloat(cells[9]?.textContent?.trim()) || 0;
-      const commission= parseFloat(cells[10]?.textContent?.trim()) || 0;
-      const swap      = parseFloat(cells[11]?.textContent?.trim()) || 0;
-      const profitRaw = cells[12]?.textContent?.trim() || cells[13]?.textContent?.trim() || "0";
-      const profit    = parseFloat(profitRaw.replace(/\s/g,"")) || 0;
+      const closeTime  = cells[9]?.textContent?.trim() || "";
+      const commission = parseFloat(cells[11]?.textContent?.trim()) || 0;
+      const swap       = parseFloat(cells[12]?.textContent?.trim()) || 0;
+      // Remove spaces and non-breaking spaces from profit
+      const profitRaw  = (cells[13]?.textContent || "0").replace(/[\s\u00a0]/g, "");
+      const profit     = parseFloat(profitRaw) || 0;
+      const net        = profit + commission + swap;
 
-      if (!openTime || !symbol || !closeTime) continue;
+      // Convert "2026.03.27 08:16:37" → "2026-03-27"
+      const closeDate = closeTime.slice(0, 10).replace(/\./g, "-");
+      const openDate  = openTime.slice(0, 10).replace(/\./g, "-");
 
-      // Parse date: "2026.03.27 08:07:15" → "2026-03-27"
-      const closeDate = closeTime.replace(/(\d{4})\.(\d{2})\.(\d{2}).*/, "$1-$2-$3");
-      const openDate  = openTime.replace(/(\d{4})\.(\d{2})\.(\d{2}).*/, "$1-$2-$3");
+      if (!closeDate || closeDate.length < 10) continue;
 
-      trades.push({ openTime, closeTime, openDate, closeDate, symbol, type, volume, openPrice, closePrice, commission, swap, profit, net: profit + commission + swap });
-    } catch(e) { continue; }
+      trades.push({
+        openDate, closeDate,
+        symbol:     cells[2]?.textContent?.trim() || "",
+        type:       cells[3]?.textContent?.trim() || "",
+        volume:     parseFloat(cells[5]?.textContent?.trim()) || 0,
+        openPrice:  parseFloat(cells[6]?.textContent?.trim()) || 0,
+        closePrice: parseFloat(cells[10]?.textContent?.trim()) || 0,
+        commission, swap, profit, net,
+      });
+    } catch { continue; }
   }
 
-  // Group by close date for daily P&L
+  if (trades.length === 0) return null;
+
+  // Aggregate daily P&L
   const dailyPnL = {};
   for (const t of trades) {
-    if (!dailyPnL[t.closeDate]) dailyPnL[t.closeDate] = { pnl:0, trades:0, wins:0 };
+    if (!dailyPnL[t.closeDate]) dailyPnL[t.closeDate] = { pnl: 0, trades: 0, wins: 0 };
     dailyPnL[t.closeDate].pnl    += t.net;
     dailyPnL[t.closeDate].trades += 1;
-    if(t.net > 0) dailyPnL[t.closeDate].wins += 1;
+    if (t.net > 0) dailyPnL[t.closeDate].wins += 1;
   }
 
-  // Summary stats
-  const totalPnL    = trades.reduce((s,t)=>s+t.net,0);
-  const grossProfit = trades.filter(t=>t.net>0).reduce((s,t)=>s+t.net,0);
-  const grossLoss   = trades.filter(t=>t.net<0).reduce((s,t)=>s+t.net,0);
-  const wins        = trades.filter(t=>t.net>0).length;
-  const losses      = trades.filter(t=>t.net<0).length;
-  const winRate     = trades.length>0?(wins/trades.length)*100:0;
-  const profitFactor= Math.abs(grossLoss)>0?grossProfit/Math.abs(grossLoss):0;
-  const symbols     = [...new Set(trades.map(t=>t.symbol))];
-  const firstDate   = trades[0]?.openDate || "";
-  const lastDate    = trades[trades.length-1]?.closeDate || "";
+  const totalPnL    = trades.reduce((s,t) => s + t.net, 0);
+  const grossProfit = trades.filter(t => t.net > 0).reduce((s,t) => s + t.net, 0);
+  const grossLoss   = trades.filter(t => t.net < 0).reduce((s,t) => s + t.net, 0);
+  const wins        = trades.filter(t => t.net > 0).length;
+  const losses      = trades.filter(t => t.net < 0).length;
+  const winRate     = trades.length > 0 ? (wins / trades.length) * 100 : 0;
+  const profitFactor= Math.abs(grossLoss) > 0 ? grossProfit / Math.abs(grossLoss) : 0;
+  const symbols     = [...new Set(trades.map(t => t.symbol))];
+  const sortedDates = Object.keys(dailyPnL).sort();
 
-  return { trades, dailyPnL, totalPnL, grossProfit, grossLoss, wins, losses, winRate, profitFactor, symbols, firstDate, lastDate, totalTrades: trades.length };
+  return {
+    trades, dailyPnL, totalPnL, grossProfit, grossLoss,
+    wins, losses, winRate, profitFactor, symbols,
+    totalTrades: trades.length,
+    firstDate: sortedDates[0] || "",
+    lastDate:  sortedDates[sortedDates.length - 1] || "",
+  };
 }
 
 // ─── Import Modal ─────────────────────────────────────────────────────────────
 function ImportModal({ open, onClose, onImported, userId, t }) {
-  const [step,    setStep]    = useState(1);
-  const [file,    setFile]    = useState(null);
-  const [parsed,  setParsed]  = useState(null);
-  const [accName, setAccName] = useState("");
-  const [provider,setProvider]= useState("");
-  const [type,    setType]    = useState("Capital Propio");
-  const [cost,    setCost]    = useState("0");
-  const [withdrawn,setWithdrawn]=useState("0");
-  const [iniBalance,setIniBalance]=useState("");
-  const [color,   setColor]   = useState("#0ea5e9");
-  const [loading, setLoading] = useState(false);
-  const [error,   setError]   = useState("");
+  const [step,      setStep]      = useState(1);
+  const [parsed,    setParsed]    = useState(null);
+  const [accName,   setAccName]   = useState("");
+  const [provider,  setProvider]  = useState("");
+  const [type,      setType]      = useState("Capital Propio");
+  const [cost,      setCost]      = useState("0");
+  const [withdrawn, setWithdrawn] = useState("0");
+  const [iniBalance,setIniBalance]= useState("");
+  const [color,     setColor]     = useState("#0ea5e9");
+  const [loading,   setLoading]   = useState(false);
+  const [error,     setError]     = useState("");
   const fileRef = useRef();
 
-  const reset = () => { setStep(1);setFile(null);setParsed(null);setAccName("");setProvider("");setType("Capital Propio");setCost("0");setWithdrawn("0");setIniBalance("");setColor("#0ea5e9");setLoading(false);setError(""); };
+  const reset = () => {
+    setStep(1); setParsed(null); setAccName(""); setProvider("");
+    setType("Capital Propio"); setCost("0"); setWithdrawn("0");
+    setIniBalance(""); setColor("#0ea5e9"); setLoading(false); setError("");
+  };
 
   const handleFile = (e) => {
     const f = e.target.files[0];
-    if(!f) return;
-    setFile(f);
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      try {
-        // Handle UTF-16 LE encoding from MT5
-        let content = ev.target.result;
-        const result = parseMT5Report(content);
-        if(result.totalTrades === 0) {
-          setError("No se encontraron trades en el archivo. Asegúrate de exportar el 'Informe detallado' desde MT5.");
-          return;
-        }
+    if (!f) return;
+    setError("");
+
+    // Try multiple encodings
+    const tryParse = (text) => {
+      const result = parseMT5Report(text);
+      if (result && result.totalTrades > 0) {
         setParsed(result);
-        setError("");
-        // Auto-fill name from file
-        setAccName(f.name.replace(/\.[^.]+$/,"").replace("ReportHistory-","AXI "));
+        // Auto-suggest name
+        const nameGuess = f.name.replace(/ReportHistory-?/, "").replace(/\.[^.]+$/, "");
+        setAccName(nameGuess ? `Cuenta ${nameGuess}` : "Mi cuenta MT5");
         setStep(2);
-      } catch(e) {
-        setError("Error leyendo el archivo: "+e.message);
+        return true;
       }
+      return false;
     };
-    reader.readAsText(f, "UTF-16LE");
+
+    // First try UTF-16 (most common for MT5)
+    const readerUtf16 = new FileReader();
+    readerUtf16.onload = (ev) => {
+      if (tryParse(ev.target.result)) return;
+      // Fallback: try UTF-8
+      const readerUtf8 = new FileReader();
+      readerUtf8.onload = (ev2) => {
+        if (!tryParse(ev2.target.result)) {
+          setError("No se encontraron trades. Asegúrate de exportar el 'Informe detallado' (no el extracto) desde MT5.");
+        }
+      };
+      readerUtf8.readAsText(f, "UTF-8");
+    };
+    readerUtf16.readAsText(f, "UTF-16");
   };
 
   const handleImport = async () => {
-    if(!accName||!iniBalance) { setError("Completa el nombre y balance inicial."); return; }
+    if (!accName || !iniBalance) { setError("Completa nombre y balance inicial."); return; }
     setLoading(true); setError("");
     try {
-      const currentBalance = (parseFloat(iniBalance)||0) + parsed.totalPnL;
+      const initBal = parseFloat(iniBalance) || 0;
+      const currBal = Math.round((initBal + parsed.totalPnL) * 100) / 100;
 
-      // 1. Create account in DB
       const { data: acc, error: accErr } = await supabase.from("mt_accounts").insert({
         user_id: userId, name: accName, provider, type,
-        cost: parseFloat(cost)||0, withdrawn: parseFloat(withdrawn)||0,
+        cost: parseFloat(cost) || 0, withdrawn: parseFloat(withdrawn) || 0,
         color, status: "Live",
-        initial_balance: parseFloat(iniBalance)||0,
-        current_balance: Math.round(currentBalance*100)/100,
+        initial_balance: initBal,
+        current_balance: currBal,
         start_date: parsed.firstDate || new Date().toISOString().split("T")[0],
         login: "imported", server: "MT5-Import",
       }).select().single();
 
-      if(accErr) throw accErr;
+      if (accErr) throw accErr;
 
-      // 2. Insert daily P&L rows
-      const pnlRows = Object.entries(parsed.dailyPnL).map(([date,d])=>({
-        user_id: userId, account_id: acc.id, date,
-        pnl: Math.round(d.pnl*100)/100,
+      // Insert daily P&L
+      const pnlRows = Object.entries(parsed.dailyPnL).map(([date, d]) => ({
+        user_id:     userId,
+        account_id:  acc.id,
+        date,
+        pnl:         Math.round(d.pnl * 100) / 100,
         trades_count: d.trades,
       }));
 
-      if(pnlRows.length > 0) {
-        const { error: pnlErr } = await supabase.from("daily_pnl").upsert(pnlRows, { onConflict:"account_id,date" });
-        if(pnlErr) throw pnlErr;
-      }
-
-      // 3. Insert balance history points
-      const histRows = Object.entries(parsed.dailyPnL)
-        .sort(([a],[b])=>a.localeCompare(b))
-        .reduce((acc2, [date, d], i, arr) => {
-          const prevBalance = i===0 ? parseFloat(iniBalance)||0 : acc2[i-1].balance;
-          acc2.push({ account_id:acc.id, balance: Math.round((prevBalance+d.pnl)*100)/100, recorded_at: date+"T23:59:00Z" });
-          return acc2;
-        }, []);
-
-      if(histRows.length > 0) {
-        await supabase.from("balance_history").insert(histRows);
+      if (pnlRows.length > 0) {
+        const { error: pnlErr } = await supabase.from("daily_pnl")
+          .upsert(pnlRows, { onConflict: "account_id,date" });
+        if (pnlErr) throw pnlErr;
       }
 
       onImported();
       onClose();
       reset();
-    } catch(e) {
-      setError(e.message||"Error importando");
+    } catch (e) {
+      setError(e.message || "Error importando");
       setLoading(false);
     }
   };
 
-  if(!open) return null;
+  if (!open) return null;
   return (
     <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,backdropFilter:"blur(6px)"}}>
       <div onClick={e=>e.stopPropagation()} style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:20,padding:32,width:"min(560px,93vw)",maxHeight:"90vh",overflowY:"auto"}}>
@@ -204,9 +216,9 @@ function ImportModal({ open, onClose, onImported, userId, t }) {
           <button onClick={()=>{onClose();reset();}} style={{background:"none",border:"none",color:t.textMuted,fontSize:22,cursor:"pointer"}}>✕</button>
         </div>
 
-        {/* Steps */}
+        {/* Steps indicator */}
         <div style={{display:"flex",gap:8,marginBottom:24}}>
-          {["Archivo","Configurar","Importar"].map((s,i)=>(
+          {["Archivo","Configurar"].map((s,i)=>(
             <div key={s} style={{flex:1,textAlign:"center"}}>
               <div style={{height:3,borderRadius:2,background:step>i?"#0ea5e9":t.border,marginBottom:6,transition:"background 0.3s"}}/>
               <span style={{fontSize:10,color:step>i?"#0ea5e9":t.textMuted,fontWeight:step>i?700:400}}>{s}</span>
@@ -214,7 +226,7 @@ function ImportModal({ open, onClose, onImported, userId, t }) {
           ))}
         </div>
 
-        {/* STEP 1 — Upload */}
+        {/* STEP 1 */}
         {step===1&&(
           <div>
             <div onClick={()=>fileRef.current?.click()}
@@ -222,34 +234,32 @@ function ImportModal({ open, onClose, onImported, userId, t }) {
               onMouseEnter={e=>e.currentTarget.style.borderColor="#0ea5e9"}
               onMouseLeave={e=>e.currentTarget.style.borderColor=t.border}>
               <div style={{fontSize:40,marginBottom:12}}>📄</div>
-              <div style={{fontSize:15,fontWeight:700,color:t.text,marginBottom:6}}>Haz clic para subir el archivo</div>
-              <div style={{fontSize:12,color:t.textMuted}}>Reporte HTML exportado desde MT5</div>
-              <div style={{fontSize:11,color:t.textMuted,marginTop:8}}>Historial → clic derecho → "Guardar como informe detallado"</div>
+              <div style={{fontSize:15,fontWeight:700,color:t.text,marginBottom:6}}>Haz clic para subir el archivo HTML</div>
+              <div style={{fontSize:12,color:t.textMuted}}>Reporte exportado desde MT5 · Formato .html</div>
               <input ref={fileRef} type="file" accept=".html,.htm" onChange={handleFile} style={{display:"none"}}/>
             </div>
             {error&&<div style={{marginTop:12,background:t.negLight,border:`1px solid ${t.negative}30`,borderRadius:9,padding:"10px 14px",fontSize:12,color:t.negative}}>{error}</div>}
-            <div style={{marginTop:16,background:t.surfaceAlt,borderRadius:10,padding:"12px 16px",border:`1px solid ${t.border}`}}>
-              <div style={{fontSize:11,fontWeight:700,color:t.textSub,marginBottom:6}}>📋 Cómo exportar desde MT5:</div>
-              <div style={{fontSize:11,color:t.textMuted,lineHeight:1.7}}>
-                1. Abre MetaTrader 5<br/>
-                2. Ve a la pestaña <b style={{color:t.textSub}}>"Historial de cuenta"</b> (abajo)<br/>
-                3. Clic derecho en cualquier parte<br/>
-                4. Selecciona <b style={{color:t.textSub}}>"Guardar como informe detallado"</b><br/>
-                5. Guarda como <b style={{color:t.textSub}}>HTML</b> y súbelo aquí
+            <div style={{marginTop:16,background:t.surfaceAlt,borderRadius:10,padding:"14px 16px",border:`1px solid ${t.border}`}}>
+              <div style={{fontSize:11,fontWeight:700,color:t.textSub,marginBottom:8}}>📋 Cómo exportar desde MT5:</div>
+              <div style={{fontSize:12,color:t.textMuted,lineHeight:1.8}}>
+                1. Abre <b style={{color:t.textSub}}>MetaTrader 5</b><br/>
+                2. Ve a la pestaña <b style={{color:t.textSub}}>"Historial de cuenta"</b> (panel inferior)<br/>
+                3. Clic derecho → <b style={{color:t.textSub}}>"Guardar como informe detallado"</b><br/>
+                4. Guarda como <b style={{color:t.textSub}}>HTML</b> y súbelo aquí
               </div>
             </div>
           </div>
         )}
 
-        {/* STEP 2 — Preview + Config */}
+        {/* STEP 2 */}
         {step===2&&parsed&&(
           <div>
-            {/* Stats preview */}
+            {/* Preview stats */}
             <div style={{background:t.surfaceAlt,borderRadius:12,padding:16,marginBottom:20,border:`1px solid ${t.border}`}}>
-              <div style={{fontSize:11,fontWeight:700,color:t.positive,marginBottom:10,textTransform:"uppercase",letterSpacing:"0.08em"}}>✅ Archivo leído correctamente</div>
+              <div style={{fontSize:11,fontWeight:700,color:t.positive,marginBottom:10,textTransform:"uppercase",letterSpacing:"0.08em"}}>✅ {parsed.totalTrades} trades encontrados</div>
               <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
                 {[
-                  {l:"Trades totales",v:parsed.totalTrades},
+                  {l:"Trades",v:parsed.totalTrades},
                   {l:"Win Rate",v:fmtPct(parsed.winRate)},
                   {l:"Profit Factor",v:fmt(parsed.profitFactor)},
                   {l:"Gross Profit",v:fmtUSD(parsed.grossProfit)},
@@ -267,7 +277,7 @@ function ImportModal({ open, onClose, onImported, userId, t }) {
               </div>
             </div>
 
-            {/* Account config */}
+            {/* Config fields */}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 14px"}}>
               <div style={{gridColumn:"1/-1",marginBottom:12}}>
                 <label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Nombre de la cuenta</label>
@@ -275,7 +285,7 @@ function ImportModal({ open, onClose, onImported, userId, t }) {
                   style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"9px 13px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/>
               </div>
               <div style={{marginBottom:12}}>
-                <label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Proveedor / Broker</label>
+                <label style={{display:"block",fontSize:10,color:t.textMuted,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.09em",fontWeight:700}}>Broker / Proveedor</label>
                 <input value={provider} onChange={e=>setProvider(e.target.value)} placeholder="AXI"
                   style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:9,padding:"9px 13px",color:t.text,fontSize:14,outline:"none",fontFamily:"inherit"}}/>
               </div>
@@ -311,14 +321,10 @@ function ImportModal({ open, onClose, onImported, userId, t }) {
 
             {/* Balance preview */}
             {iniBalance&&(
-              <div style={{background:`linear-gradient(135deg,${color}15,${color}05)`,border:`1px solid ${color}30`,borderRadius:10,padding:"12px 16px",marginBottom:16}}>
+              <div style={{background:`${color}12`,border:`1px solid ${color}30`,borderRadius:10,padding:"12px 16px",marginBottom:16}}>
                 <div style={{fontSize:11,color:t.textMuted,marginBottom:4}}>Balance actual calculado</div>
-                <div style={{fontSize:20,fontWeight:700,color:parsed.totalPnL>=0?t.positive:t.negative}}>
-                  {fmtUSD((parseFloat(iniBalance)||0)+parsed.totalPnL)}
-                </div>
-                <div style={{fontSize:11,color:t.textMuted,marginTop:2}}>
-                  {fmtUSD(parseFloat(iniBalance)||0)} inicial + {fmtUSD(parsed.totalPnL)} P&L
-                </div>
+                <div style={{fontSize:20,fontWeight:700,color:parsed.totalPnL>=0?t.positive:t.negative}}>{fmtUSD((parseFloat(iniBalance)||0)+parsed.totalPnL)}</div>
+                <div style={{fontSize:11,color:t.textMuted,marginTop:2}}>{fmtUSD(parseFloat(iniBalance)||0)} inicial + {fmtUSD(parsed.totalPnL)} P&L neto</div>
               </div>
             )}
 
@@ -327,7 +333,7 @@ function ImportModal({ open, onClose, onImported, userId, t }) {
             <div style={{display:"flex",gap:9}}>
               <button onClick={()=>setStep(1)} style={{flex:1,padding:"11px",borderRadius:9,border:`1px solid ${t.border}`,background:"transparent",color:t.textSub,fontSize:13,fontWeight:600,cursor:"pointer"}}>← Volver</button>
               <button onClick={handleImport} disabled={loading||!accName||!iniBalance}
-                style={{flex:2,padding:"11px",borderRadius:9,border:"none",background:`linear-gradient(135deg,#0ea5e9,#8b5cf6)`,color:"#fff",fontSize:13,fontWeight:700,cursor:loading?"wait":"pointer",opacity:loading||!accName||!iniBalance?0.6:1}}>
+                style={{flex:2,padding:"11px",borderRadius:9,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontSize:13,fontWeight:700,cursor:loading?"wait":"pointer",opacity:loading||!accName||!iniBalance?0.6:1}}>
                 {loading?`Importando ${parsed.totalTrades} trades...`:`📥 Importar ${parsed.totalTrades} trades`}
               </button>
             </div>
@@ -338,20 +344,18 @@ function ImportModal({ open, onClose, onImported, userId, t }) {
   );
 }
 
-// ─── Sparkline ────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function Spark({ data, color, w=60, h=22 }) {
   if(!data||data.length<2) return null;
   const mn=Math.min(...data),mx=Math.max(...data),r=mx-mn||1;
   const pts=data.map((v,i)=>`${(i/(data.length-1))*w},${h-((v-mn)/r)*h}`).join(" ");
   return <svg width={w} height={h} style={{overflow:"visible",flexShrink:0,display:"block"}}><polyline points={pts} fill="none" stroke={color} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/></svg>;
 }
-
 function StatusBadge({status}) {
   const map={Live:{bg:"#052e1690",c:"#4ade80",b:"#22c55e28"},"Evaluación":{bg:"#1c140090",c:"#fbbf24",b:"#f59e0b28"},Inactiva:{bg:"#1e1b3490",c:"#a78bfa",b:"#8b5cf628"},Suspendida:{bg:"#1a001090",c:"#fb7185",b:"#f43f5e28"}};
   const s=map[status]||map.Inactiva;
   return <span style={{fontSize:9,fontWeight:700,padding:"2px 8px",borderRadius:20,background:s.bg,color:s.c,border:`1px solid ${s.b}`,letterSpacing:"0.06em",textTransform:"uppercase"}}>{status}</span>;
 }
-
 function StatBox({label,value,sub,color,icon,t}) {
   return (
     <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:14,padding:"18px 20px"}}>
@@ -364,7 +368,6 @@ function StatBox({label,value,sub,color,icon,t}) {
     </div>
   );
 }
-
 function AccountRow({ acc, expanded, onToggle, onDelete, t }) {
   const pnl=acc.current_balance-acc.initial_balance, pct=acc.initial_balance>0?(pnl/acc.initial_balance)*100:0, pos=pnl>=0;
   return (
@@ -391,15 +394,10 @@ function AccountRow({ acc, expanded, onToggle, onDelete, t }) {
               {l:"P&L",v:`${fmtUSD(pnl)} (${fmtPct(pct)})`,c:pos?t.positive:t.negative},
               {l:"Inversión",v:fmtUSD(acc.cost),c:t.negative},
               {l:"Retirado",v:fmtUSD(acc.withdrawn),c:t.positive},
-              {l:"Beneficio neto",v:fmtUSD(acc.withdrawn-acc.cost),c:(acc.withdrawn-acc.cost)>=0?t.positive:t.negative},
+              {l:"Bficio neto",v:fmtUSD(acc.withdrawn-acc.cost),c:(acc.withdrawn-acc.cost)>=0?t.positive:t.negative},
               {l:"Inicio",v:acc.start_date||"-",c:t.textSub},
-              {l:"Fuente",v:acc.login==="imported"?"📥 CSV importado":"🔗 MT5 Live",c:t.textSub},
-            ].map(s=>(
-              <div key={s.l} style={{background:t.surface,borderRadius:8,padding:"8px 12px",border:`1px solid ${t.border}`}}>
-                <div style={{fontSize:9,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:3}}>{s.l}</div>
-                <div style={{fontSize:12,fontWeight:700,color:s.c}}>{s.v}</div>
-              </div>
-            ))}
+              {l:"Fuente",v:"📥 CSV importado",c:t.textSub},
+            ].map(s=>(<div key={s.l} style={{background:t.surface,borderRadius:8,padding:"8px 12px",border:`1px solid ${t.border}`}}><div style={{fontSize:9,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:3}}>{s.l}</div><div style={{fontSize:12,fontWeight:700,color:s.c}}>{s.v}</div></div>))}
           </div>
           <button onClick={e=>{e.stopPropagation();onDelete(acc.id);}} style={{padding:"7px 14px",borderRadius:8,border:"none",background:t.negLight,color:t.negative,fontSize:12,cursor:"pointer"}}>🗑 Eliminar</button>
         </div>
@@ -446,28 +444,25 @@ function PerformanceCalendar({ userId, accounts, t }) {
   return (
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20,flexWrap:"wrap",gap:12}}>
-        <div><h1 style={{fontSize:26,fontWeight:700,letterSpacing:"-0.03em",color:t.text}}>Calendario</h1><p style={{fontSize:12,color:t.textMuted,marginTop:3}}>P&L diario real de tus cuentas importadas</p></div>
+        <div><h1 style={{fontSize:26,fontWeight:700,letterSpacing:"-0.03em",color:t.text}}>Calendario</h1><p style={{fontSize:12,color:t.textMuted,marginTop:3}}>P&L diario real · datos de tus cuentas importadas</p></div>
         <div style={{display:"flex",gap:8,alignItems:"center"}}>
           <button onClick={()=>{if(month===0){setMonth(11);setYear(y=>y-1)}else setMonth(m=>m-1)}} style={{padding:"6px 12px",borderRadius:8,border:`1px solid ${t.border}`,background:t.surface,color:t.text,cursor:"pointer",fontSize:14}}>‹</button>
           <span style={{fontSize:13,fontWeight:700,color:t.text,minWidth:130,textAlign:"center"}}>{MONTHS[month]} {year}</span>
           <button onClick={()=>{if(month===11){setMonth(0);setYear(y=>y+1)}else setMonth(m=>m+1)}} style={{padding:"6px 12px",borderRadius:8,border:`1px solid ${t.border}`,background:t.surface,color:t.text,cursor:"pointer",fontSize:14}}>›</button>
         </div>
       </div>
-
       <div style={{display:"flex",gap:7,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
         <span style={{fontSize:11,color:t.textMuted,fontWeight:600}}>Ver:</span>
         <button onClick={()=>setFilterAcc("all")} style={{padding:"5px 12px",borderRadius:20,fontSize:11,fontWeight:600,cursor:"pointer",border:`1px solid ${filterAcc==="all"?"#0ea5e9":t.border}`,background:filterAcc==="all"?"rgba(14,165,233,0.1)":"transparent",color:filterAcc==="all"?"#0ea5e9":t.textMuted}}>Todas</button>
         {accounts.map(a=>(<button key={a.id} onClick={()=>setFilterAcc(a.id)} style={{padding:"5px 12px",borderRadius:20,fontSize:11,fontWeight:600,cursor:"pointer",border:`1px solid ${filterAcc===a.id?a.color:t.border}`,background:filterAcc===a.id?a.color+"18":"transparent",color:filterAcc===a.id?a.color:t.textMuted,display:"flex",alignItems:"center",gap:5}}><span style={{width:6,height:6,borderRadius:"50%",background:a.color,display:"inline-block"}}/>{a.name}</button>))}
       </div>
-
       <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:18}}>
         {[{l:"Total del mes",v:fmtUSD(monthTotal),c:monthTotal>=0?t.positive:t.negative},{l:"Días positivos",v:winD,c:t.positive},{l:"Días negativos",v:lossD,c:t.negative},{l:"Win rate",v:fmtPct((winD/(winD+lossD||1))*100),c:t.positive}].map(s=>(
           <div key={s.l} style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:12,padding:"12px 16px"}}><div style={{fontSize:9,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.09em",marginBottom:4}}>{s.l}</div><div style={{fontSize:20,fontWeight:700,color:s.c,letterSpacing:"-0.02em"}}>{s.v}</div></div>
         ))}
       </div>
-
       <div style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:16,padding:20}}>
-        {loading&&<div style={{textAlign:"center",padding:16,color:t.textMuted,fontSize:12}}>Cargando...</div>}
+        {loading&&<div style={{textAlign:"center",padding:12,color:t.textMuted,fontSize:12}}>Cargando...</div>}
         <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:5,marginBottom:8}}>
           {DAY_NAMES.map(d=><div key={d} style={{textAlign:"center",fontSize:10,fontWeight:700,color:t.textMuted,padding:"3px 0",textTransform:"uppercase",letterSpacing:"0.07em"}}>{d}</div>)}
         </div>
@@ -491,19 +486,17 @@ function PerformanceCalendar({ userId, accounts, t }) {
           <span style={{fontSize:10,color:t.textMuted}}>Ganancia</span>
         </div>
       </div>
-
       {editDay&&(<div onClick={()=>setEditDay(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.6)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:2000,backdropFilter:"blur(4px)"}}><div onClick={e=>e.stopPropagation()} style={{background:t.surface,border:`1px solid ${t.border}`,borderRadius:16,padding:28,width:300}}><div style={{fontSize:14,fontWeight:700,color:t.text,marginBottom:3}}>Editar P&L</div><div style={{fontSize:11,color:t.textMuted,marginBottom:14}}>{editDay}</div><input value={editVal} onChange={e=>setEditVal(e.target.value)} type="number" style={{width:"100%",boxSizing:"border-box",background:t.surfaceAlt,border:`1px solid ${t.border}`,borderRadius:10,padding:"10px 14px",color:t.text,fontSize:16,fontWeight:600,outline:"none",marginBottom:14,fontFamily:"inherit"}}/><div style={{display:"flex",gap:9}}><button onClick={()=>setEditDay(null)} style={{flex:1,padding:"9px",borderRadius:9,border:`1px solid ${t.border}`,background:"transparent",color:t.textSub,cursor:"pointer",fontFamily:"inherit"}}>Cancelar</button><button onClick={async()=>{const v=parseFloat(editVal)||0;setDailyData(p=>({...p,[editDay]:v}));if(filterAcc!=="all")await supabase.from("daily_pnl").upsert({user_id:userId,account_id:filterAcc,date:editDay,pnl:v},{onConflict:"account_id,date"});setEditDay(null);}} style={{flex:2,padding:"9px",borderRadius:9,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>Guardar</button></div></div></div>)}
     </div>
   );
 }
 
-// ─── Landing ──────────────────────────────────────────────────────────────────
 function LandingPage({ onGoToLogin }) {
-  const features=[{icon:"📊",title:"Dashboard Consolidado",desc:"Fondeo, capital propio y futuros en una sola vista clara."},{icon:"📥",title:"Importa tu historial MT5",desc:"Sube tu reporte HTML de MT5 y tu P&L diario aparece automáticamente."},{icon:"📅",title:"Calendario de P&L",desc:"Heatmap diario de ganancias y pérdidas. Identifica tus mejores días."},{icon:"🗂️",title:"Grupos y Familias",desc:"Organiza tus cuentas por estrategia, broker o firma."},{icon:"📈",title:"ROI Real",desc:"Calcula tu beneficio neto real: retirado menos invertido."},{icon:"🔒",title:"Multi-perfil Seguro",desc:"Cada usuario tiene su propio acceso. Tus datos son solo tuyos."}];
+  const features=[{icon:"📊",title:"Dashboard Consolidado",desc:"Fondeo, capital propio y futuros en una sola vista."},{icon:"📥",title:"Importa tu historial MT5",desc:"Sube el reporte HTML y tu P&L diario aparece automáticamente."},{icon:"📅",title:"Calendario de P&L",desc:"Heatmap diario. Identifica tus mejores y peores días."},{icon:"🗂️",title:"Grupos y Familias",desc:"Organiza tus cuentas como quieras."},{icon:"📈",title:"ROI Real",desc:"Beneficio neto real: retirado menos invertido."},{icon:"🔒",title:"Multi-perfil",desc:"Cada usuario tiene su propio espacio privado."}];
   return (
     <div style={{minHeight:"100vh",background:"#080c14",color:"#e6eaf4",fontFamily:"'Plus Jakarta Sans',system-ui,sans-serif",overflowX:"hidden"}}>
-      <style>{`@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&family=Instrument+Serif:ital@0;1&display=swap');*{box-sizing:border-box;margin:0;padding:0}@keyframes fadeUp{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-10px)}}@keyframes pulse{0%,100%{opacity:0.4}50%{opacity:0.8}}.fade-up{animation:fadeUp 0.7s ease forwards}.float{animation:float 4s ease-in-out infinite}.hero-btn:hover{transform:translateY(-2px);box-shadow:0 8px 32px rgba(14,165,233,0.4)}.feature-card:hover{transform:translateY(-4px);border-color:#0ea5e940}`}</style>
-      <nav style={{position:"fixed",top:0,left:0,right:0,zIndex:100,padding:"16px 48px",display:"flex",justifyContent:"space-between",alignItems:"center",background:"rgba(8,12,20,0.9)",backdropFilter:"blur(12px)",borderBottom:"1px solid #141923"}}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&family=Instrument+Serif:ital@0;1&display=swap');*{box-sizing:border-box;margin:0;padding:0}@keyframes fadeUp{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}@keyframes pulse{0%,100%{opacity:0.4}50%{opacity:0.8}}.fade-up{animation:fadeUp 0.7s ease forwards}.hero-btn:hover{transform:translateY(-2px);box-shadow:0 8px 32px rgba(14,165,233,0.4)}.feature-card:hover{transform:translateY(-4px);border-color:#0ea5e940}`}</style>
+      <nav style={{position:"fixed",top:0,left:0,right:0,zIndex:100,padding:"16px 48px",display:"flex",justifyContent:"space-between",alignItems:"center",background:"rgba(8,12,20,0.92)",backdropFilter:"blur(12px)",borderBottom:"1px solid #141923"}}>
         <div style={{fontSize:18,fontWeight:800,letterSpacing:"-0.03em"}}><span style={{color:"#0ea5e9"}}>Mayahouse</span><span style={{color:"#e6eaf4"}}>FX</span></div>
         <div style={{display:"flex",gap:8}}>
           <button onClick={onGoToLogin} style={{padding:"8px 20px",borderRadius:8,border:"1px solid #232e42",background:"transparent",color:"#7d8fa8",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>Iniciar sesión</button>
@@ -520,10 +513,8 @@ function LandingPage({ onGoToLogin }) {
           Controla cada cuenta.{" "}
           <span style={{fontFamily:"'Instrument Serif',serif",fontStyle:"italic",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>Mide tu verdadero ROI.</span>
         </h1>
-        <p className="fade-up" style={{fontSize:"clamp(15px,2vw,19px)",color:"#7d8fa8",maxWidth:560,lineHeight:1.65,marginBottom:40,animationDelay:"0.3s"}}>
-          Importa tu historial de MT5 y visualiza todo tu rendimiento real en segundos.
-        </p>
-        <div className="fade-up" style={{display:"flex",gap:12,flexWrap:"wrap",justifyContent:"center",animationDelay:"0.4s"}}>
+        <p className="fade-up" style={{fontSize:"clamp(15px,2vw,19px)",color:"#7d8fa8",maxWidth:560,lineHeight:1.65,marginBottom:40,animationDelay:"0.3s"}}>Importa tu historial de MT5 y visualiza todo tu rendimiento real en segundos.</p>
+        <div className="fade-up" style={{display:"flex",gap:12,justifyContent:"center",animationDelay:"0.4s"}}>
           <button className="hero-btn" onClick={onGoToLogin} style={{padding:"14px 32px",borderRadius:12,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontSize:15,fontWeight:700,cursor:"pointer",transition:"all 0.2s",fontFamily:"inherit"}}>Entrar al dashboard →</button>
         </div>
       </section>
@@ -541,12 +532,10 @@ function LandingPage({ onGoToLogin }) {
   );
 }
 
-// ─── Login ────────────────────────────────────────────────────────────────────
 function LoginPage({ onLogin, onBack }) {
   const [mode,setMode]=useState("login");
   const [email,setEmail]=useState(""), [password,setPassword]=useState(""), [name,setName]=useState("");
   const [error,setError]=useState(""), [loading,setLoading]=useState(false), [showPass,setShowPass]=useState(false);
-
   const handleLogin = async () => {
     setError(""); if(!email||!password){setError("Completa todos los campos.");return;} setLoading(true);
     const {data,error:e}=await supabase.auth.signInWithPassword({email,password});
@@ -554,7 +543,6 @@ function LoginPage({ onLogin, onBack }) {
     const {data:prof}=await supabase.from("profiles").select("*").eq("id",data.user.id).single();
     onLogin({...data.user,name:prof?.name||email,avatar:prof?.avatar||email.slice(0,2).toUpperCase()});
   };
-
   const handleRegister = async () => {
     setError(""); if(!name||!email||!password){setError("Completa todos los campos.");return;}
     if(password.length<8){setError("La contraseña debe tener al menos 8 caracteres.");return;} setLoading(true);
@@ -562,22 +550,21 @@ function LoginPage({ onLogin, onBack }) {
     if(e){setError(e.message);setLoading(false);return;}
     onLogin({...data.user,name,avatar:name.split(" ").map(w=>w[0]).join("").toUpperCase().slice(0,2)});
   };
-
   return (
     <div style={{minHeight:"100vh",background:"#080c14",display:"flex",fontFamily:"'Plus Jakarta Sans',system-ui,sans-serif"}}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&family=Instrument+Serif:ital@0;1&display=swap');*{box-sizing:border-box;margin:0;padding:0}@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}.login-input:focus{border-color:#0ea5e9!important;outline:none}`}</style>
       <div style={{flex:1,background:"linear-gradient(135deg,#0c1018,#0d1526)",display:"flex",flexDirection:"column",justifyContent:"space-between",padding:"40px 48px",position:"relative",overflow:"hidden"}}>
         <div style={{position:"absolute",top:-100,right:-100,width:400,height:400,borderRadius:"50%",background:"radial-gradient(circle,rgba(14,165,233,0.07) 0%,transparent 70%)",pointerEvents:"none"}}/>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-          <div style={{fontSize:18,fontWeight:800,letterSpacing:"-0.03em"}}><span style={{color:"#0ea5e9"}}>Mayahouse</span><span style={{color:"#e6eaf4"}}>FX</span></div>
+          <div style={{fontSize:18,fontWeight:800}}><span style={{color:"#0ea5e9"}}>Mayahouse</span><span style={{color:"#e6eaf4"}}>FX</span></div>
           <button onClick={onBack} style={{fontSize:12,color:"#3d4f66",background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>← Volver</button>
         </div>
         <div style={{animation:"fadeUp 0.7s ease forwards"}}>
           <div style={{fontSize:11,fontWeight:700,color:"#0ea5e9",textTransform:"uppercase",letterSpacing:"0.12em",marginBottom:16}}>Performance Tracker</div>
           <h2 style={{fontSize:"clamp(28px,3vw,42px)",fontWeight:900,letterSpacing:"-0.04em",lineHeight:1.1,color:"#e6eaf4",marginBottom:20}}>Tu portafolio.<br/><span style={{fontFamily:"'Instrument Serif',serif",fontStyle:"italic",color:"#0ea5e9"}}>Todo claro.</span></h2>
-          <p style={{fontSize:14,color:"#7d8fa8",lineHeight:1.65,maxWidth:380}}>Importa tu historial MT5 y ve tu P&L real día a día en segundos.</p>
+          <p style={{fontSize:14,color:"#7d8fa8",lineHeight:1.65,maxWidth:380}}>Importa tu historial MT5 y ve tu P&L real día a día.</p>
           <div style={{marginTop:36,display:"flex",flexDirection:"column",gap:12}}>
-            {["Importa reporte HTML desde MT5 — 1 clic","Dashboard consolidado de todas tus cuentas","Calendario de P&L diario con heatmap","ROI y beneficio neto en tiempo real"].map(f=>(
+            {["Importa reporte HTML desde MT5 en 1 clic","Calendario de P&L diario con heatmap","Dashboard consolidado de todas tus cuentas","ROI y beneficio neto en tiempo real"].map(f=>(
               <div key={f} style={{display:"flex",alignItems:"center",gap:10}}>
                 <div style={{width:18,height:18,borderRadius:"50%",background:"rgba(34,208,122,0.15)",border:"1px solid #22d07a40",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}><span style={{fontSize:10,color:"#22d07a"}}>✓</span></div>
                 <span style={{fontSize:13,color:"#7d8fa8"}}>{f}</span>
@@ -586,7 +573,7 @@ function LoginPage({ onLogin, onBack }) {
           </div>
         </div>
         <div style={{background:"#141923",border:"1px solid #232e42",borderRadius:14,padding:"18px 20px"}}>
-          <div style={{fontSize:13,color:"#7d8fa8",lineHeight:1.6,marginBottom:12,fontStyle:"italic"}}>"Finalmente puedo ver en un solo lugar cuánto llevo invertido, cuánto he retirado y cuál es mi ROI real."</div>
+          <div style={{fontSize:13,color:"#7d8fa8",lineHeight:1.6,marginBottom:12,fontStyle:"italic"}}>"Finalmente puedo ver en un solo lugar cuánto llevo invertido y cuál es mi ROI real."</div>
           <div style={{display:"flex",alignItems:"center",gap:10}}>
             <div style={{width:32,height:32,borderRadius:"50%",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:"#fff"}}>GM</div>
             <div><div style={{fontSize:12,fontWeight:700,color:"#e6eaf4"}}>Gabriel Maya</div><div style={{fontSize:11,color:"#3d4f66"}}>Trader · AXI + FTMO</div></div>
@@ -622,7 +609,6 @@ function LoginPage({ onLogin, onBack }) {
   );
 }
 
-// ─── Dashboard ────────────────────────────────────────────────────────────────
 function Dashboard({ user, onLogout }) {
   const [dark,setDark]=useState(true);
   const t=dark?T.dark:T.light;
@@ -638,7 +624,6 @@ function Dashboard({ user, onLogout }) {
     setAccounts(data||[]);
     setLoadingData(false);
   };
-
   useEffect(()=>{ fetchData(); },[user.id]);
 
   const deleteAccount = async (id) => {
@@ -649,7 +634,7 @@ function Dashboard({ user, onLogout }) {
     setAccounts(p=>p.filter(a=>a.id!==id));
   };
 
-  const SS = useMemo(()=>{
+  const SS=useMemo(()=>{
     const ti=accounts.reduce((s,a)=>s+a.cost,0), tw=accounts.reduce((s,a)=>s+a.withdrawn,0);
     const tc=accounts.reduce((s,a)=>s+a.current_balance,0), tini=accounts.reduce((s,a)=>s+a.initial_balance,0);
     const pnl=tc-tini, nb=tw-ti, roi=ti>0?(nb/ti)*100:0;
@@ -661,8 +646,6 @@ function Dashboard({ user, onLogout }) {
   return (
     <div style={{minHeight:"100vh",background:t.bg,color:t.text,fontFamily:"'Plus Jakarta Sans',system-ui,sans-serif",display:"flex"}}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}::-webkit-scrollbar{width:5px}::-webkit-scrollbar-thumb{background:#232e42;border-radius:3px}button{font-family:inherit}select option{background:#141923}@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}`}</style>
-
-      {/* SIDEBAR */}
       <div style={{width:212,background:t.sidebar,borderRight:`1px solid ${t.border}`,display:"flex",flexDirection:"column",padding:"22px 0",position:"fixed",top:0,left:0,bottom:0,zIndex:100}}>
         <div style={{padding:"0 20px 20px"}}>
           <div style={{fontSize:15,fontWeight:800,letterSpacing:"-0.03em",marginBottom:10}}><span style={{color:"#0ea5e9"}}>Mayahouse</span><span style={{color:"#e6eaf4"}}>FX</span></div>
@@ -678,7 +661,6 @@ function Dashboard({ user, onLogout }) {
         <div style={{padding:"0 12px"}}><button onClick={onLogout} style={{width:"100%",padding:"8px 0",borderRadius:9,border:`1px solid ${t.border}`,background:"transparent",color:"#5a6d85",fontSize:11,fontWeight:600,cursor:"pointer"}}>← Cerrar sesión</button></div>
       </div>
 
-      {/* CONTENT */}
       <div style={{marginLeft:212,flex:1,padding:"32px 36px",maxWidth:"calc(100vw - 212px)"}}>
         {loadingData?(
           <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"60vh",flexDirection:"column",gap:16}}>
@@ -687,14 +669,13 @@ function Dashboard({ user, onLogout }) {
           </div>
         ):(
           <>
-          {/* DASHBOARD */}
           {view==="dashboard"&&(<>
             <div style={{marginBottom:24}}><h1 style={{fontSize:26,fontWeight:700,letterSpacing:"-0.03em",color:t.text}}>Dashboard</h1><p style={{color:t.textMuted,fontSize:12,marginTop:3}}>Bienvenido, {user.name?.split(" ")[0]} · {accounts.length} cuentas</p></div>
             {accounts.length===0?(
               <div style={{textAlign:"center",padding:"80px 20px",background:t.surface,border:`2px dashed ${t.border}`,borderRadius:16}}>
                 <div style={{fontSize:48,marginBottom:16}}>📥</div>
                 <h3 style={{fontSize:18,fontWeight:700,color:t.text,marginBottom:8}}>Importa tu primer reporte MT5</h3>
-                <p style={{fontSize:13,color:t.textMuted,marginBottom:24,maxWidth:400,margin:"0 auto 24px"}}>Exporta el historial detallado desde MetaTrader 5 y súbelo aquí. Tu P&L diario aparecerá automáticamente.</p>
+                <p style={{fontSize:13,color:t.textMuted,marginBottom:24,maxWidth:400,margin:"0 auto 24px"}}>Exporta el historial detallado desde MetaTrader 5 y súbelo aquí.</p>
                 <button onClick={()=>setImportModal(true)} style={{padding:"12px 28px",borderRadius:10,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontSize:14,fontWeight:700,cursor:"pointer"}}>📥 Importar ahora</button>
               </div>
             ):(
@@ -725,27 +706,14 @@ function Dashboard({ user, onLogout }) {
               </>
             )}
           </>)}
-
-          {/* ACCOUNTS */}
           {view==="accounts"&&(<>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:22}}>
-              <div><h1 style={{fontSize:26,fontWeight:700,letterSpacing:"-0.03em",color:t.text}}>Mis Cuentas</h1><p style={{color:t.textMuted,fontSize:12,marginTop:3}}>{accounts.length} cuentas importadas</p></div>
+              <div><h1 style={{fontSize:26,fontWeight:700,letterSpacing:"-0.03em",color:t.text}}>Mis Cuentas</h1><p style={{color:t.textMuted,fontSize:12,marginTop:3}}>{accounts.length} cuentas</p></div>
               <button onClick={()=>setImportModal(true)} style={{padding:"9px 18px",borderRadius:9,border:"none",background:"linear-gradient(135deg,#0ea5e9,#8b5cf6)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}}>📥 Importar MT5</button>
             </div>
-            {accounts.length===0?(
-              <div style={{textAlign:"center",padding:"60px 20px",background:t.surface,border:`2px dashed ${t.border}`,borderRadius:16}}>
-                <div style={{fontSize:40,marginBottom:12}}>📭</div>
-                <p style={{color:t.textMuted,fontSize:13}}>No tienes cuentas importadas aún</p>
-              </div>
-            ):(
-              accounts.map(a=><AccountRow key={a.id} acc={a} expanded={expandedId===a.id} onToggle={()=>setExpandedId(expandedId===a.id?null:a.id)} onDelete={deleteAccount} t={t}/>)
-            )}
+            {accounts.length===0?(<div style={{textAlign:"center",padding:"60px 20px",background:t.surface,border:`2px dashed ${t.border}`,borderRadius:16}}><div style={{fontSize:40,marginBottom:12}}>📭</div><p style={{color:t.textMuted,fontSize:13}}>No tienes cuentas importadas aún</p></div>):(accounts.map(a=><AccountRow key={a.id} acc={a} expanded={expandedId===a.id} onToggle={()=>setExpandedId(expandedId===a.id?null:a.id)} onDelete={deleteAccount} t={t}/>))}
           </>)}
-
-          {/* CALENDAR */}
           {view==="calendar"&&<PerformanceCalendar userId={user.id} accounts={accounts} t={t}/>}
-
-          {/* MONTHLY */}
           {view==="monthly"&&(<>
             <div style={{marginBottom:22}}><h1 style={{fontSize:26,fontWeight:700,letterSpacing:"-0.03em",color:t.text}}>Resumen Mensual</h1></div>
             {accounts.map(a=>{
@@ -753,32 +721,21 @@ function Dashboard({ user, onLogout }) {
               return(<div key={a.id} style={{border:`1px solid ${t.border}`,borderLeft:`3px solid ${a.color}`,borderRadius:10,padding:"14px 18px",marginBottom:8,background:t.surface,display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
                 <div style={{flex:1}}><div style={{fontSize:13,fontWeight:700,color:t.text}}>{a.name}</div><div style={{fontSize:11,color:t.textMuted}}>{a.provider} · {a.type}</div></div>
                 {[{l:"Balance",v:fmtUSD(a.current_balance),c:t.text},{l:"P&L",v:`${fmtUSD(pnl)} (${fmtPct(pct)})`,c:pnl>=0?t.positive:t.negative},{l:"Inversión",v:fmtUSD(a.cost),c:t.negative},{l:"Retirado",v:fmtUSD(a.withdrawn),c:t.positive},{l:"Neto",v:fmtUSD(nb),c:nb>=0?t.positive:t.negative}].map(s=>(<div key={s.l} style={{textAlign:"right"}}><div style={{fontSize:9,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:3}}>{s.l}</div><div style={{fontSize:13,fontWeight:700,color:s.c}}>{s.v}</div></div>))}
-                <span style={{fontSize:10,color:"#22d07a",background:"rgba(34,208,122,0.1)",padding:"3px 10px",borderRadius:20}}>📥 Importada</span>
               </div>);
             })}
-            {accounts.length>0&&(
-              <div style={{background:t.surface,border:`2px solid rgba(14,165,233,0.18)`,borderRadius:14,padding:"20px 24px",marginTop:12}}>
-                <div style={{fontSize:10,fontWeight:700,color:"#0ea5e9",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:16}}>Totales</div>
-                <div style={{display:"flex",gap:24,flexWrap:"wrap"}}>
-                  {[{l:"Invertido",v:fmtUSD(SS.ti),c:t.negative},{l:"Retirado",v:fmtUSD(SS.tw),c:t.positive},{l:"Beneficio neto",v:fmtUSD(SS.nb),c:SS.nb>=0?t.positive:t.negative},{l:"P&L",v:fmtUSD(SS.pnl),c:SS.pnl>=0?t.positive:t.negative},{l:"ROI",v:fmtPct(SS.roi),c:SS.roi>=0?t.positive:t.negative}].map(s=>(<div key={s.l}><div style={{fontSize:9,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.09em",marginBottom:5}}>{s.l}</div><div style={{fontSize:20,fontWeight:700,color:s.c}}>{s.v}</div></div>))}
-                </div>
-              </div>
-            )}
+            {accounts.length>0&&(<div style={{background:t.surface,border:`2px solid rgba(14,165,233,0.18)`,borderRadius:14,padding:"20px 24px",marginTop:12}}><div style={{fontSize:10,fontWeight:700,color:"#0ea5e9",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:16}}>Totales</div><div style={{display:"flex",gap:24,flexWrap:"wrap"}}>{[{l:"Invertido",v:fmtUSD(SS.ti),c:t.negative},{l:"Retirado",v:fmtUSD(SS.tw),c:t.positive},{l:"Beneficio neto",v:fmtUSD(SS.nb),c:SS.nb>=0?t.positive:t.negative},{l:"P&L",v:fmtUSD(SS.pnl),c:SS.pnl>=0?t.positive:t.negative},{l:"ROI",v:fmtPct(SS.roi),c:SS.roi>=0?t.positive:t.negative}].map(s=>(<div key={s.l}><div style={{fontSize:9,color:t.textMuted,textTransform:"uppercase",letterSpacing:"0.09em",marginBottom:5}}>{s.l}</div><div style={{fontSize:20,fontWeight:700,color:s.c}}>{s.v}</div></div>))}</div></div>)}
           </>)}
           </>
         )}
       </div>
-
       <ImportModal open={importModal} onClose={()=>setImportModal(false)} onImported={fetchData} userId={user.id} t={t}/>
     </div>
   );
 }
 
-// ─── Root ─────────────────────────────────────────────────────────────────────
 export default function MayahouseFX() {
   const [screen,setScreen]=useState("landing");
   const [user,setUser]=useState(null);
-
   useEffect(()=>{
     supabase.auth.getSession().then(({data:{session}})=>{
       if(session?.user){
@@ -789,10 +746,8 @@ export default function MayahouseFX() {
       }
     });
   },[]);
-
   const handleLogin=(u)=>{ setUser(u); setScreen("dashboard"); };
   const handleLogout=async()=>{ await supabase.auth.signOut(); setUser(null); setScreen("landing"); };
-
   if(screen==="landing") return <LandingPage onGoToLogin={()=>setScreen("login")}/>;
   if(screen==="login")   return <LoginPage onLogin={handleLogin} onBack={()=>setScreen("landing")}/>;
   if(screen==="dashboard") return <Dashboard user={user} onLogout={handleLogout}/>;
